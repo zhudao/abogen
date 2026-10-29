@@ -1,11 +1,12 @@
-from abogen.webui.routes.utils import preview
+from abogen.domain.enums import Language
+from abogen.webui.routes.utils import synthesize
 
 
 def test_preview_applies_manual_override_before_normalization(monkeypatch):
     # Don't run real TTS/normalization; just exercise the override stage by
     # forcing provider=kokoro and then stubbing normalize_for_pipeline.
 
-    monkeypatch.setattr(preview, "get_preview_pipeline", lambda language, device: None)
+    monkeypatch.setattr(synthesize, "get_preview_pipeline", lambda language, device: None)
 
     # Stub normalize_for_pipeline to be identity; we only care that overrides run.
     class _Norm:
@@ -30,22 +31,22 @@ def test_preview_applies_manual_override_before_normalization(monkeypatch):
             captured["text"] = text
             return iter(())
 
-    from abogen import tts_backend_registry
+    from abogen.tts_plugin import utils
 
-    original_create_backend = tts_backend_registry.create_backend
+    original_create_pipeline = utils.create_pipeline
 
-    def _mock_create_backend(backend_id, **kwargs):
+    def _mock_create_pipeline(backend_id, **kwargs):
         if backend_id == "supertonic":
             return DummyPipeline(**kwargs)
-        return original_create_backend(backend_id, **kwargs)
+        return original_create_pipeline(backend_id, **kwargs)
 
-    monkeypatch.setattr(tts_backend_registry, "create_backend", _mock_create_backend)
+    monkeypatch.setattr(utils, "create_pipeline", _mock_create_pipeline)
 
     try:
-        preview.generate_preview_audio(
+        synthesize.generate_preview_audio(
             text="He said Unfu*k loudly.",
             voice_spec="M1",
-            language="en",
+            language=Language.EN_US,
             speed=1.0,
             use_gpu=False,
             tts_provider="supertonic",

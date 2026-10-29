@@ -5,8 +5,12 @@ import tempfile
 import platform
 import base64
 import re
+import logging
 from abogen.pyqt.queue_manager_gui import QueueManager
 from abogen.pyqt.queued_item import QueuedItem
+
+_log = logging.getLogger("abogen.gui")
+
 import abogen.hf_tracker as hf_tracker
 import hashlib  # Added for cache path generation
 from PyQt6.QtWidgets import (
@@ -69,27 +73,31 @@ from abogen.utils import (
     LoadPipelineThread,
 )
 
-from abogen.subtitle_utils import (
-    clean_text,
-    calculate_text_length,
-)
+from abogen.subtitle_utils import clean_text
+from abogen.domain.text_utils import calculate_text_length
 
 from abogen.pyqt.conversion import ConversionThread, VoicePreviewThread, PlayAudioThread, ChapterOptionsDialog, TimestampDetectionDialog
 from abogen.pyqt.book_handler import HandlerDialog
+from abogen.domain.enums import Language
 from abogen.constants import (
     PROGRAM_NAME,
     VERSION,
     GITHUB_URL,
     PROGRAM_DESCRIPTION,
     LANGUAGE_DESCRIPTIONS,
-    VOICES_INTERNAL,
     SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION,
     COLORS,
     SUBTITLE_FORMATS,
 )
+from abogen.tts_plugin.utils import get_voices
 import threading
 from abogen.pyqt.voice_formula_gui import VoiceFormulaDialog
-from abogen.voice_profiles import load_profiles
+from abogen.voice_profiles import load_profiles, resolve_profile_language
+from abogen.domain.settings_core import all_settings_defaults
+from plugins.kokoro.engine import language_for_code, language_for_voice_id
+
+# Module-level default cache for use outside __init__
+_DEFAULTS = all_settings_defaults()
 
 # Import ctypes for Windows-specific taskbar icon
 if platform.system() == "Windows":
@@ -127,6 +135,28 @@ class ThreadSafeLogSignal(QObject):
 
     def emit_log(self, message):
         self.log_signal.emit(message)
+
+
+_UPDATE_CHECK_URL = "https://raw.githubusercontent.com/denizsafak/abogen/refs/heads/main/abogen/VERSION"
+_UPDATE_CHECK_TIMEOUT = 8  # seconds; bounds offline/DNS hangs so the GUI never blocks
+
+
+class _UpdateCheckThread(QThread):
+    """Fetch the remote VERSION file off the GUI thread."""
+
+    succeeded = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def run(self):
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(
+                _UPDATE_CHECK_URL, timeout=_UPDATE_CHECK_TIMEOUT
+            ) as response:
+                self.succeeded.emit(response.read().decode().strip())
+        except Exception as exc:  # offline, DNS hang, HTTP error, ...
+            self.failed.emit(str(exc))
 
 
 class IconProvider(QFileIconProvider):
@@ -394,11 +424,7 @@ class InputBox(QLabel):
         # Re-enable subtitle and replace newlines controls when cleared
         window = self.window()
         if hasattr(window, "subtitle_combo"):
-            # Only enable if language supports it
-            current_lang = getattr(window, "selected_lang", "a")
-            window.subtitle_combo.setEnabled(
-                current_lang in SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION
-            )
+            window.subtitle_combo.setEnabled(True)
         if hasattr(window, "replace_newlines_combo"):
             window.replace_newlines_combo.setEnabled(True)
 
@@ -837,7 +863,7 @@ class WordSubstitutionsDialog(QDialog):
             self,
         )
         instructions.setStyleSheet(
-            "padding: 10px; background-color: #f0f0f0; border-radius: 5px;"
+            f"padding: 10px; background-color: {COLORS['GREY_BACKGROUND']}; border-radius: 5px;"
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
@@ -911,9 +937,10 @@ class abogen(QWidget):
     def __init__(self):
         super().__init__()
         self.config = load_config()
-        self.apply_theme(self.config.get("theme", "system"))
+        _d = all_settings_defaults()
+        self.apply_theme(self.config.get("theme", _d["theme"]))
         migrate_subtitle_format(self.config)
-        self.check_updates = self.config.get("check_updates", True)
+        self.check_updates = self.config.get("check_updates", _d["check_updates"])
         self.save_option = self.config.get("save_option", "Save next to input file")
         self.selected_output_folder = self.config.get("selected_output_folder", None)
         self.selected_file = self.selected_file_type = self.selected_book_path = None
@@ -921,7 +948,7 @@ class abogen(QWidget):
             None  # Add new variable to track the displayed file path
         )
         # Max log lines
-        self.log_window_max_lines = self.config.get("log_window_max_lines", 2000)
+        self.log_window_max_lines = self.config.get("log_window_max_lines", _d["log_window_max_lines"])
         self.selected_chapters = set()
         self.last_opened_book_path = None  # Track the last opened book path
         self.last_output_path = None
@@ -936,40 +963,28 @@ class abogen(QWidget):
             self.selected_voice = None
             self.selected_lang = None
         else:
-            self.selected_voice = self.config.get("selected_voice", "af_heart")
-            self.selected_lang = self.selected_voice[0] if self.selected_voice else None
+            self.selected_voice = self.config.get("selected_voice", _d["selected_voice"])
+            self.selected_lang = language_for_voice_id(self.selected_voice)
         self.is_converting = False
-        self.subtitle_mode = self.config.get("subtitle_mode", "Sentence")
-        self.max_subtitle_words = self.config.get(
-            "max_subtitle_words", 50
-        )  # Default max words per subtitle
-        self.silence_duration = self.config.get(
-            "silence_duration", 2.0
-        )  # Default silence duration
-        self.selected_format = self.config.get("selected_format", "wav")
-        self.separate_chapters_format = self.config.get(
-            "separate_chapters_format", "wav"
-        )  # Format for individual chapter files
-        self.use_gpu = self.config.get(
-            "use_gpu", True  # Load GPU setting with default True
-        )
-        self.replace_single_newlines = self.config.get("replace_single_newlines", True)
-        self.use_silent_gaps = self.config.get("use_silent_gaps", True)
-        self.subtitle_speed_method = self.config.get("subtitle_speed_method", "tts")
-        self.use_spacy_segmentation = self.config.get("use_spacy_segmentation", True)
+        self.subtitle_mode = self.config.get("subtitle_mode", _d["subtitle_mode"])
+        self.max_subtitle_words = self.config.get("max_subtitle_words", _d["max_subtitle_words"])
+        self.silence_duration = self.config.get("silence_duration", _d.get("silence_between_chapters", 2.0))
+        self.selected_format = self.config.get("selected_format", _d["selected_format"])
+        self.separate_chapters_format = self.config.get("separate_chapters_format", _d["separate_chapters_format"])
+        self.use_gpu = self.config.get("use_gpu", _d["use_gpu"])
+        self.replace_single_newlines = self.config.get("replace_single_newlines", _d.get("replace_single_newlines", True))
+        self.use_silent_gaps = self.config.get("use_silent_gaps", _d["use_silent_gaps"])
+        self.subtitle_speed_method = self.config.get("subtitle_speed_method", _d["subtitle_speed_method"])
+        self.use_spacy_segmentation = self.config.get("use_spacy_segmentation", _d["use_spacy_segmentation"])
+        self.read_title_intro = self.config.get("read_title_intro", _d.get("read_title_intro", False))
+        self.read_closing_outro = self.config.get("read_closing_outro", _d.get("read_closing_outro", True))
         # Word substitution settings
-        self.word_substitutions_enabled = self.config.get(
-            "word_substitutions_enabled", False
-        )
-        self.word_substitutions_list = self.config.get("word_substitutions_list", "")
-        self.case_sensitive_substitutions = self.config.get(
-            "case_sensitive_substitutions", False
-        )
-        self.replace_all_caps = self.config.get("replace_all_caps", False)
-        self.replace_numerals = self.config.get("replace_numerals", False)
-        self.fix_nonstandard_punctuation = self.config.get(
-            "fix_nonstandard_punctuation", False
-        )
+        self.word_substitutions_enabled = self.config.get("word_substitutions_enabled", _d["word_substitutions_enabled"])
+        self.word_substitutions_list = self.config.get("word_substitutions_list", _d["word_substitutions_list"])
+        self.case_sensitive_substitutions = self.config.get("case_sensitive_substitutions", _d["case_sensitive_substitutions"])
+        self.replace_all_caps = self.config.get("replace_all_caps", _d["replace_all_caps"])
+        self.replace_numerals = self.config.get("replace_numerals", _d["replace_numerals"])
+        self.fix_nonstandard_punctuation = self.config.get("fix_nonstandard_punctuation", _d["fix_nonstandard_punctuation"])
         self._pending_close_event = None
         self.gpu_ok = False  # Initialize GPU availability status
 
@@ -996,8 +1011,13 @@ class abogen(QWidget):
         self.queued_items = []
         self.current_queue_index = 0
 
-        self.initUI()
-        self.speed_slider.setValue(int(self.config.get("speed", 1.00) * 100))
+        from abogen.utils import timed_log
+        import logging
+        _startup_log = logging.getLogger("abogen.startup")
+
+        with timed_log("GUI initUI (widget building)", logger=_startup_log):
+            self.initUI()
+        self.speed_slider.setValue(int(self.config.get("speed", _d["speed"]) * 100))
         self.update_speed_label()
         # Set initial selection: prefer profile, else voice
         idx = -1
@@ -1011,13 +1031,17 @@ class abogen(QWidget):
             if self.selected_profile_name:
                 from abogen.voice_profiles import load_profiles
 
-                entry = load_profiles().get(self.selected_profile_name, {})
+                with timed_log("voice profile load", logger=_startup_log):
+                    entry = load_profiles().get(self.selected_profile_name, {})
                 if isinstance(entry, dict):
                     self.mixed_voice_state = entry.get("voices", [])
-                    self.selected_lang = entry.get("language")
+                    self.selected_lang = resolve_profile_language(entry)
                 else:
                     self.mixed_voice_state = entry
-                    self.selected_lang = entry[0][0] if entry and entry[0] else None
+                    self.selected_lang = (
+                        language_for_voice_id(entry[0]) if entry and entry[0] else Language.EN_US
+                    )
+        self.update_subtitle_options_availability()
         if self.save_option == "Choose output folder" and self.selected_output_folder:
             self.save_path_label.setText(self.selected_output_folder)
             self.save_path_row_widget.show()
@@ -1183,6 +1207,7 @@ class abogen(QWidget):
             "Sentence + Comma: Subtitles will be generated for each sentence and comma.\n"
             "Sentence + Highlighting: Subtitles with word-by-word karaoke highlighting.\n"
             "1+ word: Subtitles will be generated for each word(s).\n\n"
+            "Word-count and highlighting modes are only available for English.\n"
             "Supported languages for subtitle generation:\n"
             + "\n".join(
                 f'"{lang}" => {LANGUAGE_DESCRIPTIONS.get(lang, lang)}'
@@ -1761,8 +1786,9 @@ class abogen(QWidget):
 
     def update_subtitle_options_availability(self):
         """
-        Update the enabled state of subtitle options based on the selected language.
-        For non-English languages, only sentence-based and line-based modes are supported.
+        Update the enabled state of subtitle options based on the selected
+        language and input type. Subtitle generation works for every language,
+        but word-count and highlighting modes are only available for English.
         """
         # Check if current file is a subtitle file
         is_subtitle_input = False
@@ -1771,16 +1797,14 @@ class abogen(QWidget):
         ):
             is_subtitle_input = True
 
-        if self.selected_lang not in SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION:
-            self.subtitle_combo.setEnabled(False)
-            self.subtitle_format_combo.setEnabled(False)
-            return
-
         # Only enable subtitle_combo if it's NOT a subtitle input
         self.subtitle_combo.setEnabled(not is_subtitle_input)
         self.subtitle_format_combo.setEnabled(True)
 
-        is_english = self.selected_lang in ["a", "b"]
+        is_english = self.selected_lang in (
+            Language.EN_US,
+            Language.EN_GB,
+        )
 
         # Items to keep enabled for non-English
         allowed_modes = ["Disabled", "Line", "Sentence", "Sentence + Comma"]
@@ -1795,10 +1819,7 @@ class abogen(QWidget):
             if is_english:
                 item.setEnabled(True)
             else:
-                if text in allowed_modes:
-                    item.setEnabled(True)
-                else:
-                    item.setEnabled(False)
+                item.setEnabled(text in allowed_modes)
 
         # If current selection is disabled, switch to a valid one
         current_text = self.subtitle_combo.currentText()
@@ -1817,7 +1838,7 @@ class abogen(QWidget):
 
     def on_voice_changed(self, index):
         voice = self.voice_combo.itemData(index)
-        self.selected_voice, self.selected_lang = voice, voice[0]
+        self.selected_voice, self.selected_lang = voice, language_for_voice_id(voice)
         self.config["selected_voice"] = voice
         save_config(self.config)
         # Enable/disable subtitle options based on language
@@ -1834,10 +1855,12 @@ class abogen(QWidget):
             # set mixed voices and language
             if isinstance(entry, dict):
                 self.mixed_voice_state = entry.get("voices", [])
-                self.selected_lang = entry.get("language")
+                self.selected_lang = resolve_profile_language(entry)
             else:
                 self.mixed_voice_state = entry
-                self.selected_lang = entry[0][0] if entry and entry[0] else None
+                self.selected_lang = (
+                    language_for_voice_id(entry[0]) if entry and entry[0] else Language.EN_US
+                )
             self.selected_voice = None
             self.config["selected_profile_name"] = pname
             self.config.pop("selected_voice", None)
@@ -1847,7 +1870,7 @@ class abogen(QWidget):
         else:
             self.mixed_voice_state = None
             self.selected_profile_name = None
-            self.selected_voice, self.selected_lang = data, data[0]
+            self.selected_voice, self.selected_lang = data, language_for_voice_id(data)
             self.config["selected_voice"] = data
             if "selected_profile_name" in self.config:
                 del self.config["selected_profile_name"]
@@ -1858,8 +1881,9 @@ class abogen(QWidget):
         from abogen.voice_profiles import load_profiles
 
         entry = load_profiles().get(profile_name, {})
-        lang = entry.get("language") if isinstance(entry, dict) else None
-        enable = lang in SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION
+        enable = (
+            resolve_profile_language(entry) in SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION
+        )
         self.subtitle_combo.setEnabled(enable)
         self.subtitle_format_combo.setEnabled(enable)
 
@@ -1873,7 +1897,7 @@ class abogen(QWidget):
         for pname in load_profiles().keys():
             self.voice_combo.addItem(profile_icon, pname, f"profile:{pname}")
         # re-add voices
-        for v in VOICES_INTERNAL:
+        for v in get_voices("kokoro"):
             icon = QIcon()
             flag_path = get_resource_path("abogen.assets.flags", f"{v[0]}.png")
             if flag_path and os.path.exists(flag_path):
@@ -2160,7 +2184,7 @@ class abogen(QWidget):
             )
 
             # CHECK GLOBAL OVERRIDE SETTING
-            if not self.config.get("queue_override_settings", False):
+            if not self.config.get("queue_override_settings", _DEFAULTS["queue_override_settings"]):
                 self.selected_lang = queued_item.lang_code
                 self.speed_slider.setValue(int(queued_item.speed * 100))
                 
@@ -2234,26 +2258,25 @@ class abogen(QWidget):
             self.current_queue_index = 0  # Reset for next time
 
     def get_voice_formula(self) -> str:
+        from abogen.voice_formulas import pairs_to_formula
+
         if self.mixed_voice_state:
-            formula_components = [
-                f"{name}*{weight}" for name, weight in self.mixed_voice_state
-            ]
-            return " + ".join(filter(None, formula_components))
+            return pairs_to_formula(self.mixed_voice_state) or ""
         else:
             return self.selected_voice
 
-    def get_selected_lang(self, voice_formula) -> str:
+    def get_selected_lang(self, voice_formula) -> Language:
         if self.selected_profile_name:
             from abogen.voice_profiles import load_profiles
 
             entry = load_profiles().get(self.selected_profile_name, {})
-            selected_lang = entry.get("language")
+            selected_lang = resolve_profile_language(entry)
         else:
-            selected_lang = self.selected_voice[0] if self.selected_voice else None
+            selected_lang = language_for_voice_id(self.selected_voice)
         # fallback: extract from formula if missing
         if not selected_lang:
             m = re.search(r"\b([a-z])", voice_formula)
-            selected_lang = m.group(1) if m else None
+            selected_lang = language_for_code(m.group(1)) if m else Language.EN_US
         return selected_lang
 
     def get_actual_subtitle_mode(self) -> str:
@@ -2402,6 +2425,9 @@ class abogen(QWidget):
                 self.conversion_thread.merge_chapters_at_end = getattr(
                     self, "merge_chapters_at_end", True
                 )
+            # Pass intro/outro settings
+            self.conversion_thread.read_title_intro = self.read_title_intro
+            self.conversion_thread.read_closing_outro = self.read_closing_outro
             self.conversion_thread.progress_updated.connect(self.update_progress)
             self.conversion_thread.log_updated.connect(self.update_log)
             self.conversion_thread.conversion_finished.connect(
@@ -2426,18 +2452,9 @@ class abogen(QWidget):
             self.update_log((gpu_msg, gpu_ok))
             self.update_log("Loading modules...")
 
-            # Determine device based on GPU availability
-            if gpu_ok:
-                if platform.system() == "Darwin" and platform.processor() == "arm":
-                    device = "mps"
-                else:
-                    device = "cuda"
-            else:
-                device = "cpu"
-
-            lang_code = self.selected_lang or "a"
+            lang_code = self.selected_lang or Language.EN_US
             load_thread = LoadPipelineThread(
-                pipeline_loaded_callback, lang_code=lang_code, device=device
+                pipeline_loaded_callback, lang_code=lang_code, use_gpu=gpu_ok
             )
             load_thread.start()
 
@@ -2449,7 +2466,7 @@ class abogen(QWidget):
             return
 
         # Check if override was active (this determines which settings were ACTUALLY used)
-        override_active = self.config.get("queue_override_settings", False)
+        override_active = self.config.get("queue_override_settings", _DEFAULTS["queue_override_settings"])
 
         # If override is ON, capture the global settings that were used for processing
         if override_active:
@@ -2766,12 +2783,12 @@ class abogen(QWidget):
                 from abogen.voice_profiles import load_profiles
 
                 entry = load_profiles().get(self.selected_profile_name, {})
-                lang_to_cache = entry.get("language")
+                lang_to_cache = resolve_profile_language(entry)
             else:
                 lang_to_cache = self.selected_lang
             if not lang_to_cache and self.mixed_voice_state:
                 lang_to_cache = (
-                    self.mixed_voice_state[0][0][0]
+                    language_for_voice_id(self.mixed_voice_state[0][0])
                     if self.mixed_voice_state and self.mixed_voice_state[0][0]
                     else None
                 )
@@ -2875,18 +2892,9 @@ class abogen(QWidget):
             )
             self.loading_movie.start()
 
-        # Determine device based on GPU availability
-        if self.gpu_ok:
-            if platform.system() == "Darwin" and platform.processor() == "arm":
-                device = "mps"
-            else:
-                device = "cuda"
-        else:
-            device = "cpu"
-
-        lang = self.selected_lang or "a"
+        lang = self.selected_lang or Language.EN_US
         load_thread = LoadPipelineThread(
-            self._on_pipeline_loaded_for_preview, lang_code=lang, device=device
+            self._on_pipeline_loaded_for_preview, lang_code=lang, use_gpu=self.gpu_ok
         )
         load_thread.start()
 
@@ -2916,17 +2924,17 @@ class abogen(QWidget):
                 from abogen.voice_profiles import load_profiles
 
                 entry = load_profiles().get(self.selected_profile_name, {})
-                lang = entry.get("language")
+                lang = resolve_profile_language(entry)
             else:
                 lang = self.selected_lang
             if not lang and self.mixed_voice_state:
                 lang = (
-                    self.mixed_voice_state[0][0][0]
+                    language_for_voice_id(self.mixed_voice_state[0][0])
                     if self.mixed_voice_state and self.mixed_voice_state[0][0]
                     else None
                 )
         else:
-            lang = self.selected_voice[0]
+            lang = language_for_voice_id(self.selected_voice)
             voice = self.selected_voice
 
         # use same gpu/cpu logic as in conversion
@@ -3187,14 +3195,25 @@ class abogen(QWidget):
             save_config(self.config)
 
     def cleanup_conversion_thread(self):
-        # Stop conversion thread
+        # Stop conversion thread (bounded wait so closing never hangs)
         if (
             hasattr(self, "conversion_thread")
             and self.conversion_thread is not None
             and self.conversion_thread.isRunning()
         ):
+            _log.info("Close: stopping conversion thread")
+            start = time.perf_counter()
             self.conversion_thread.cancel()
-            self.conversion_thread.wait()
+            if not self.conversion_thread.wait(2000):
+                _log.warning("Close: conversion thread did not stop in 2s, terminating")
+                self.conversion_thread.terminate()
+                self.conversion_thread.wait(1000)
+            _log.info(
+                "Close: conversion thread stopped in %.2fs",
+                time.perf_counter() - start,
+            )
+        else:
+            _log.info("Close: no running conversion thread")
 
     def cleanup_preview_threads(self):
         # Stop preview generation thread
@@ -3203,8 +3222,13 @@ class abogen(QWidget):
             and self.preview_thread is not None
             and self.preview_thread.isRunning()
         ):
+            _log.info("Close: terminating preview thread")
+            start = time.perf_counter()
             self.preview_thread.terminate()
-            self.preview_thread.wait()
+            self.preview_thread.wait(1000)
+            _log.info(
+                "Close: preview thread stopped in %.2fs", time.perf_counter() - start
+            )
 
         # Stop audio playback thread
         if (
@@ -3212,8 +3236,13 @@ class abogen(QWidget):
             and self.play_audio_thread is not None
             and self.play_audio_thread.isRunning()
         ):
+            _log.info("Close: stopping audio playback thread")
+            start = time.perf_counter()
             self.play_audio_thread.stop()
-            self.play_audio_thread.wait()
+            self.play_audio_thread.wait(1000)
+            _log.info(
+                "Close: audio thread stopped in %.2fs", time.perf_counter() - start
+            )
 
         # Cleanup pygame mixer if initialized
         try:
@@ -3224,6 +3253,7 @@ class abogen(QWidget):
             pass
 
     def closeEvent(self, event):
+        _log.info("Close: window close requested (converting=%s)", self.is_converting)
         if self.is_converting:
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Warning)
@@ -3236,10 +3266,12 @@ class abogen(QWidget):
             )
             box.setDefaultButton(QMessageBox.StandardButton.No)
             if box.exec() == QMessageBox.StandardButton.Yes:
+                _log.info("Close: user confirmed exit during conversion")
                 self.cleanup_conversion_thread()
                 self.cleanup_preview_threads()
                 event.accept()
             else:
+                _log.info("Close: user cancelled exit")
                 event.ignore()
         else:
             self.cleanup_conversion_thread()
@@ -3430,7 +3462,7 @@ class abogen(QWidget):
         app.installEventFilter(app._dark_titlebar_event_filter)
 
         # Save config if changed
-        if self.config.get("theme", "system") != theme:
+        if self.config.get("theme", _DEFAULTS["theme"]) != theme:
             self.config["theme"] = theme
             save_config(self.config)
 
@@ -3452,7 +3484,7 @@ class abogen(QWidget):
         ]
 
         # Get current theme from config, default to "system"
-        current_theme = self.config.get("theme", "system")
+        current_theme = self.config.get("theme", _DEFAULTS["theme"])
         for value, text in theme_options:
             theme_action = QAction(text, self)
             theme_action.setCheckable(True)
@@ -3583,6 +3615,27 @@ class abogen(QWidget):
         # Add separator
         menu.addSeparator()
 
+        # Add title intro option
+        self.title_intro_action = QAction("Read title intro before first chapter", self)
+        self.title_intro_action.setCheckable(True)
+        self.title_intro_action.setChecked(self.read_title_intro)
+        self.title_intro_action.triggered.connect(
+            lambda checked: self.toggle_read_title_intro(checked)
+        )
+        menu.addAction(self.title_intro_action)
+
+        # Add closing outro option
+        self.closing_outro_action = QAction("Read closing outro after last chapter", self)
+        self.closing_outro_action.setCheckable(True)
+        self.closing_outro_action.setChecked(self.read_closing_outro)
+        self.closing_outro_action.triggered.connect(
+            lambda checked: self.toggle_read_closing_outro(checked)
+        )
+        menu.addAction(self.closing_outro_action)
+
+        # Add separator
+        menu.addSeparator()
+
         # Add "Pre-download models and voices for offline use" option
         predownload_action = QAction(
             "Pre-download models and voices for offline use", self
@@ -3594,7 +3647,7 @@ class abogen(QWidget):
         disable_kokoro_action = QAction("Disable Kokoro's internet access", self)
         disable_kokoro_action.setCheckable(True)
         disable_kokoro_action.setChecked(
-            self.config.get("disable_kokoro_internet", False)
+            self.config.get("disable_kokoro_internet", _DEFAULTS["disable_kokoro_internet"])
         )
         disable_kokoro_action.triggered.connect(
             lambda checked: self.toggle_kokoro_internet_access(checked)
@@ -3604,7 +3657,7 @@ class abogen(QWidget):
         # Add check for updates option
         check_updates_action = QAction("Check for updates at startup", self)
         check_updates_action.setCheckable(True)
-        check_updates_action.setChecked(self.config.get("check_updates", True))
+        check_updates_action.setChecked(self.config.get("check_updates", _DEFAULTS["check_updates"]))
         check_updates_action.triggered.connect(self.toggle_check_updates)
         menu.addAction(check_updates_action)
 
@@ -3657,6 +3710,16 @@ class abogen(QWidget):
     def toggle_spacy_segmentation(self, enabled):
         self.use_spacy_segmentation = enabled
         self.config["use_spacy_segmentation"] = enabled
+        save_config(self.config)
+
+    def toggle_read_title_intro(self, enabled):
+        self.read_title_intro = enabled
+        self.config["read_title_intro"] = enabled
+        save_config(self.config)
+
+    def toggle_read_closing_outro(self, enabled):
+        self.read_closing_outro = enabled
+        self.config["read_closing_outro"] = enabled
         save_config(self.config)
 
     def restart_app(self):
@@ -3937,7 +4000,9 @@ Categories=AudioVideo;Audio;Utility;
                     initial_state = entry.get("voices", [])
                 else:
                     initial_state = entry
-                    self.selected_lang = entry[0][0] if entry and entry[0] else None
+                    self.selected_lang = (
+                        language_for_voice_id(entry[0]) if entry and entry[0] else Language.EN_US
+                    )
         dialog = VoiceFormulaDialog(
             self, initial_state=initial_state, selected_profile=selected_profile
         )
@@ -4034,75 +4099,85 @@ Categories=AudioVideo;Audio;Utility;
         self.check_for_updates_startup()
 
     def check_for_updates_startup(self):
-        import urllib.request
-
-        def show_update_message(remote_version, local_version):
-            msg_box = QMessageBox(self)
-            msg_box.setIcon(QMessageBox.Icon.Information)
-            msg_box.setWindowTitle("Update Available")
-            msg_box.setText(
-                f"A new version of {PROGRAM_NAME} is available! ({local_version} > {remote_version})"
-            )
-            msg_box.setInformativeText(
-                f"If you installed via pip, update by running:\n"
-                f"pip install --upgrade {PROGRAM_NAME}\n\n"
-                f"If you're using the Windows portable version, run 'WINDOWS_INSTALL.bat' again.\n\n"
-                "Alternatively, visit the GitHub repository for more information. "
-                "Would you like to view the changelog?"
-            )
-            msg_box.setStandardButtons(
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
-            if msg_box.exec() == QMessageBox.StandardButton.Yes:
-                try:
-                    QDesktopServices.openUrl(QUrl(GITHUB_URL + "/releases/latest"))
-                except Exception:
-                    pass
-
-        # Reset flag to track if we should show "no updates" message
+        # Network I/O runs in a worker thread: urlopen without a timeout on
+        # the GUI thread froze the whole app when offline (DNS/connect can
+        # hang for minutes). Results return via signals on the GUI thread.
+        thread = getattr(self, "_update_check_thread", None)
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    return
+            except RuntimeError:
+                pass  # previous thread already finished/deleted
         show_result = (
             hasattr(self, "_show_update_check_result")
             and self._show_update_check_result
         )
         self._show_update_check_result = False
+        self._update_check_thread = _UpdateCheckThread(self)
+        self._update_check_thread.succeeded.connect(
+            lambda remote_raw: self._on_update_check_done(remote_raw, show_result)
+        )
+        self._update_check_thread.failed.connect(
+            lambda err: self._on_update_check_failed(err, show_result)
+        )
+        self._update_check_thread.finished.connect(
+            self._update_check_thread.deleteLater
+        )
+        self._update_check_thread.start()
 
+    def _on_update_check_done(self, remote_raw, show_result):
+        remote_version = remote_raw.strip()
+        local_version = VERSION
         try:
-            update_url = "https://raw.githubusercontent.com/denizsafak/abogen/refs/heads/main/abogen/VERSION"
-            with urllib.request.urlopen(update_url) as response:
-                remote_raw = response.read().decode().strip()
-            local_raw = VERSION
+            remote_num = int("".join(remote_version.split(".")))
+            local_num = int("".join(local_version.split(".")))
+        except ValueError:
+            return
+        if remote_num > local_num:
+            # Use QTimer to ensure UI is ready, then show update message.
+            QTimer.singleShot(
+                1000,
+                lambda: self._show_update_message(remote_version, local_version),
+            )
+        elif show_result:
+            QMessageBox.information(
+                self,
+                "Up to Date",
+                f"You are running the latest version of {PROGRAM_NAME} ({local_version}).",
+            )
 
-            # Parse version numbers
-            remote_version = remote_raw
-            local_version = local_raw
+    def _on_update_check_failed(self, err, show_result):
+        if show_result:
+            QMessageBox.warning(
+                self,
+                "Update Check Failed",
+                f"Could not check for updates:\n{err}",
+            )
 
+    def _show_update_message(self, remote_version, local_version):
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.setWindowTitle("Update Available")
+        msg_box.setText(
+            f"A new version of {PROGRAM_NAME} is available! ({local_version} > {remote_version})"
+        )
+        msg_box.setInformativeText(
+            f"If you installed via pip, update by running:\n"
+            f"pip install --upgrade {PROGRAM_NAME}\n\n"
+            f"If you're using the Windows portable version, run 'WINDOWS_INSTALL.bat' again.\n\n"
+            "Alternatively, visit the GitHub repository for more information. "
+            "Would you like to view the changelog?"
+        )
+        msg_box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if msg_box.exec() == QMessageBox.StandardButton.Yes:
             try:
-                remote_num = int("".join(remote_version.split(".")))
-                local_num = int("".join(local_version.split(".")))
-            except ValueError as ve:
-                return
-
-            if remote_num > local_num:
-                # Use QTimer to ensure UI is ready, then show update message.
-                QTimer.singleShot(
-                    1000, lambda: show_update_message(remote_version, local_version)
-                )
-            elif show_result:
-                # Show "no updates" message if manually checking
-                QMessageBox.information(
-                    self,
-                    "Up to Date",
-                    f"You are running the latest version of {PROGRAM_NAME} ({local_version}).",
-                )
-        except Exception as e:
-            if show_result:
-                QMessageBox.warning(
-                    self,
-                    "Update Check Failed",
-                    f"Could not check for updates:\n{str(e)}",
-                )
-            pass
+                QDesktopServices.openUrl(QUrl(GITHUB_URL + "/releases/latest"))
+            except Exception:
+                pass
 
     def clear_cache_files(self):
         """Clear cache files created by the program."""
@@ -4205,8 +4280,6 @@ Categories=AudioVideo;Audio;Utility;
 
     def set_max_log_lines(self):
         """Open a dialog to set the maximum lines in the log window."""
-        from PyQt6.QtWidgets import QInputDialog
-
         value, ok = QInputDialog.getInt(
             self,
             "Max Lines in Log Window",
@@ -4228,9 +4301,7 @@ Categories=AudioVideo;Audio;Utility;
 
     def set_max_subtitle_words(self):
         """Open a dialog to set the maximum words per subtitle"""
-        from PyQt6.QtWidgets import QInputDialog
-
-        current_value = self.config.get("max_subtitle_words", 50)
+        current_value = self.config.get("max_subtitle_words", _DEFAULTS["max_subtitle_words"])
 
         value, ok = QInputDialog.getInt(
             self,
@@ -4258,7 +4329,7 @@ Categories=AudioVideo;Audio;Utility;
     def set_silence_between_chapters(self):
         """Open a dialog to set the silence duration between chapters"""
 
-        current_value = self.config.get("silence_duration", 2.0)
+        current_value = self.config.get("silence_duration", _DEFAULTS.get("silence_between_chapters", 2.0))
 
         dlg = QInputDialog(self)
         dlg.setWindowTitle("Silence Duration (seconds)")

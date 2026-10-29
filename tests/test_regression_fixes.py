@@ -90,3 +90,10 @@ def test_manual_override_normalization():
     assert normalize_manual_override_token("The") == "the"
     assert normalize_manual_override_token("  A  ") == "a"
     assert normalize_manual_override_token("word") == "word"
+
+
+def test_paragraph_breaks_and_ellipsis_preserved():
+    normalized = normalize("Test. Lorem ipsum...\n\nLorem...\n\nLorem ...")
+    assert "\n\n" in normalized
+    assert ". . ." not in normalized
+    assert "Lorem..." in normalized

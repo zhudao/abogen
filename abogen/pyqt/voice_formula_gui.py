@@ -28,11 +28,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QSize
 from PyQt6.QtGui import QPixmap, QIcon, QAction
 from abogen.constants import (
-    VOICES_INTERNAL,
-    SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION,
     LANGUAGE_DESCRIPTIONS,
     COLORS,
 )
+from abogen.tts_plugin.utils import get_voices
 import re
 import platform
 from abogen.utils import get_resource_path
@@ -179,7 +178,7 @@ class VoiceMixer(QWidget):
         layout.addWidget(QLabel(name), alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Voice name label with gender icon
-        is_female = self.voice_name in VOICES_INTERNAL and self.voice_name[1] == "f"
+        is_female = self.voice_name in get_voices("kokoro") and self.voice_name[1] == "f"
 
         # Icons layout (flag and gender)
         icons_layout = QHBoxLayout()
@@ -772,7 +771,7 @@ class VoiceFormulaDialog(QDialog):
 
     def add_voices(self, initial_state):
         first_enabled_voice = None
-        for voice in VOICES_INTERNAL:
+        for voice in get_voices("kokoro"):
             language_code = voice[0]  # First character is the language code
             matching_voice = next(
                 (item for item in initial_state if item[0] == voice), None
@@ -949,7 +948,9 @@ class VoiceFormulaDialog(QDialog):
         lang = state.get("language") if isinstance(state, dict) else None
         # apply language selection
         if lang:
-            i = self.language_combo.findData(lang)
+            from abogen.voice_profiles import resolve_profile_language
+
+            i = self.language_combo.findData(resolve_profile_language(state))
             if i >= 0:
                 self.language_combo.blockSignals(True)
                 self.language_combo.setCurrentIndex(i)
@@ -1571,9 +1572,10 @@ class VoiceFormulaDialog(QDialog):
             parent.selected_profile_name = None
             lang = self.language_combo.currentData()
             parent.selected_lang = lang
-            parent.subtitle_combo.setEnabled(
-                lang in SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION
-            )
+            if hasattr(parent, "update_subtitle_options_availability"):
+                parent.update_subtitle_options_availability()
+            else:
+                parent.subtitle_combo.setEnabled(True)
             # Reset start flag and trigger preview
             self._started = False
             parent.preview_voice()

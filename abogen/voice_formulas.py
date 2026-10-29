@@ -1,7 +1,7 @@
 import re
-from typing import List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
-from abogen.constants import VOICES_INTERNAL
+from abogen.tts_plugin.utils import get_voices
 
 
 # Calls parsing and loads the voice to gpu or cpu
@@ -22,6 +22,7 @@ def parse_formula_terms(formula: str) -> List[Tuple[str, float]]:
         raise ValueError("Empty voice formula")
 
     terms: List[Tuple[str, float]] = []
+    kokoro_voices = get_voices("kokoro")
     for segment in formula.split("+"):
         part = segment.strip()
         if not part:
@@ -30,7 +31,7 @@ def parse_formula_terms(formula: str) -> List[Tuple[str, float]]:
             raise ValueError("Each component must be in the form voice*weight")
         voice_name, raw_weight = part.split("*", 1)
         voice_name = voice_name.strip()
-        if voice_name not in VOICES_INTERNAL:
+        if voice_name not in kokoro_voices:
             raise ValueError(f"Unknown voice: {voice_name}")
         try:
             weight = float(raw_weight.strip())
@@ -69,6 +70,33 @@ def parse_voice_formula(pipeline, formula):
         raise ValueError("Voice formula produced no components")
 
     return weighted_sum
+
+
+def pairs_to_formula(pairs: Iterable[Tuple[str, float]]) -> Optional[str]:
+    """Build a voice formula string from (voice_name, weight) pairs.
+
+    Normalizes weights to sum to 1.0 and formats as "voice1*0.5+voice2*0.5".
+
+    Args:
+        pairs: Iterable of (voice_name, weight) tuples. Zero-weight entries
+            are filtered out.
+
+    Returns:
+        Formula string, or None if no valid entries.
+    """
+    voices = [(voice, float(weight)) for voice, weight in pairs if weight is not None and float(weight) > 0]
+    if not voices:
+        return None
+    total = sum(weight for _, weight in voices)
+    if total <= 0:
+        return None
+
+    def _format_value(value: float) -> str:
+        normalized = value / total if total else 0.0
+        return (f"{normalized:.4f}").rstrip("0").rstrip(".") or "0"
+
+    parts = [f"{voice}*{_format_value(weight)}" for voice, weight in voices]
+    return "+".join(parts)
 
 
 def calculate_sum_from_formula(formula):

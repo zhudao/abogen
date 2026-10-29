@@ -1,0 +1,393 @@
+"""Unified conversion planner.
+
+Pure functions that take a ConversionRequest and produce a ConversionPlan.
+No side effects, no I/O — all complexity from both UIs in one place.
+
+This is Stage 2 of the conversion flow unification plan.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+from abogen.application.conversion_models import (
+    ChapterPlan,
+    ConversionPlan,
+    IntroOutroSpec,
+    SegmentPlan,
+)
+from abogen.application.conversion_request import ConversionRequest
+from abogen.application.output_layout_service import resolve_output_layout
+from abogen.domain.chapter_overrides import apply_chapter_overrides
+from abogen.domain.file_type import auto_select_relevant_chapters
+from abogen.domain.intro_outro import resolve_intro, resolve_outro
+from abogen.domain.metadata_extraction import extract_metadata_for_file
+from abogen.domain.metadata_merge import merge_metadata
+from abogen.domain.voice_markers import split_text_by_voice_markers
+
+
+def build_conversion_plan(request: ConversionRequest) -> ConversionPlan:
+    """Build a complete conversion plan from a request.
+
+    This is the single entry point that both UIs will call.
+    It handles all the planning logic that was previously duplicated
+    in both PyQt and WebUI conversion runners.
+
+    Args:
+        request: Normalized conversion request
+
+    Returns:
+        ConversionPlan with all chapters, segments, and output layout
+
+    Raises:
+        ValueError: If request is invalid (no source, no chapters, etc.)
+    """
+    # 1. Extract and validate source
+    source_text = _extract_source_text(request)
+    if not source_text or not source_text.strip():
+        raise ValueError("No text content to convert")
+
+    # 2. Extract metadata
+    metadata, extraction = _extract_metadata(request)
+
+    # 3. Parse chapters
+    raw_chapters = _parse_chapters(source_text, request)
+
+    # 4. Apply chapter selection/overrides
+    selected_chapters = _apply_selection(raw_chapters, request)
+
+    # 5. Build segments for each chapter
+    chapters = _build_chapters(selected_chapters, request)
+
+    # 6. Build intro/outro
+    intro, outro = _build_intro_outro(metadata, request)
+
+    # 7. Resolve output layout
+    output_layout = resolve_output_layout(request)
+
+    logging.info(
+        "[planner] Plan built: chapters=%d intro=%s outro=%s",
+        len(chapters),
+        bool(intro and intro.enabled),
+        bool(outro and outro.enabled),
+    )
+
+    return ConversionPlan(
+        request=request,
+        metadata=metadata,
+        chapters=chapters,
+        intro=intro,
+        outro=outro,
+        output_layout=output_layout,
+        extraction=extraction,
+    )
+
+
+def _extract_source_text(request: ConversionRequest) -> Optional[str]:
+    """Extract text from request source."""
+    from abogen.subtitle_utils import clean_text
+
+    if request.direct_text:
+        text = clean_text(request.direct_text)
+    elif request.source_path and request.source_path.exists():
+        encoding = "utf-8"
+        try:
+            with open(request.source_path, "r", encoding=encoding, errors="replace") as f:
+                text = f.read()
+        except Exception:
+            return None
+        text = clean_text(text)
+    else:
+        return None
+
+    # Apply word substitutions if configured
+    if request.word_substitution:
+        from abogen.word_substitution import apply_word_substitutions
+
+        ws = request.word_substitution
+        text = apply_word_substitutions(
+            text,
+            ws.substitutions_list,
+            ws.case_sensitive,
+            ws.replace_caps,
+            ws.replace_numerals,
+            ws.fix_punctuation,
+        )
+
+    return text
+
+
+def _extract_metadata(
+    request: ConversionRequest,
+) -> Tuple[Dict[str, Any], Optional[Any]]:
+    """Extract metadata from source file.
+
+    Returns (metadata, extraction) tuple.
+    """
+    if request.direct_text:
+        return dict(request.metadata_tags), None
+
+    if request.source_path and request.source_path.exists():
+        try:
+            extraction = extract_metadata_for_file(
+                str(request.source_path), is_direct_text=False
+            )
+            metadata = dict(extraction.metadata) if extraction.metadata else {}
+        except Exception:
+            extraction = None
+            metadata = {}
+        metadata = merge_metadata(metadata, request.metadata_tags)
+        return metadata, extraction
+
+    return dict(request.metadata_tags), None
+
+
+def _parse_chapters(
+    source_text: str, request: ConversionRequest
+) -> List[Tuple[str, str, str]]:
+    """Parse source text into raw chapters.
+
+    Returns list of (title, body_text, default_voice) tuples.
+    """
+    from abogen.domain.text_chapters import parse_chapters_from_text
+
+    # Text is already cleaned in _extract_source_text, so clean=False here
+    chapters = parse_chapters_from_text(source_text, default_title="text", clean=False)
+
+    # Default voice from request
+    default_voice = request.voice or "M1"
+
+    return [(title, text, default_voice) for title, text in chapters]
+
+
+def _apply_selection(
+    raw_chapters: List[Tuple[str, str, str]], request: ConversionRequest
+) -> List[Tuple[str, str, str]]:
+    """Apply chapter selection and overrides."""
+    from abogen.text_extractor import ExtractedChapter
+
+    # Convert to ExtractedChapter objects for auto_select_relevant_chapters
+    extracted = [
+        ExtractedChapter(title=title, text=text)
+        for title, text, _ in raw_chapters
+    ]
+
+    # If user specified chapters, apply overrides
+    chapter_chunk = request.chapter_chunk
+    if chapter_chunk and chapter_chunk.chapter_overrides:
+        selected, _, diagnostics = apply_chapter_overrides(extracted, chapter_chunk.chapter_overrides)
+        if selected:
+            # Map back to (title, text, voice) tuples
+            result = []
+            for ch in selected:
+                # Find matching original chapter to get voice
+                voice = request.voice or "M1"
+                for orig_title, orig_text, orig_voice in raw_chapters:
+                    if orig_title == ch.title:
+                        voice = orig_voice
+                        break
+                result.append((ch.title, ch.text or "", voice))
+            return result
+        # If no chapters selected, fall through to auto-selection
+
+    # Auto-select relevant chapters
+    from abogen.domain.file_type import infer_file_type
+
+    file_type = infer_file_type(request.source_path) if request.source_path else "text"
+    result = auto_select_relevant_chapters(extracted, file_type)
+    filtered = result.kept
+
+    if filtered:
+        # Map back to (title, text, voice) tuples
+        result = []
+        for ch in filtered:
+            voice = request.voice or "M1"
+            for orig_title, orig_text, orig_voice in raw_chapters:
+                if orig_title == ch.title:
+                    voice = orig_voice
+                    break
+            result.append((ch.title, ch.text or "", voice))
+        return result
+
+    # Fall back to all chapters
+    return raw_chapters
+
+
+def _build_chapters(
+    selected_chapters: List[Tuple[str, str, str]], request: ConversionRequest
+) -> List[ChapterPlan]:
+    """Build ChapterPlan with SegmentPlan for each chapter."""
+    from abogen.domain.chapter_titles import normalize_chapter_opening_caps
+
+    chapters = []
+
+    for idx, (title, body_text, default_voice) in enumerate(selected_chapters, 1):
+        # Apply caps normalization to body text if enabled
+        if request.normalize_chapter_opening_caps and body_text:
+            body_text, _ = normalize_chapter_opening_caps(body_text)
+
+        # Build segments for this chapter (idx is 1-based, chunks use 0-based)
+        segments = _build_segments(body_text, default_voice, request, chapter_index=idx - 1)
+
+        chapter = ChapterPlan(
+            index=idx,
+            title=title,
+            original_title=title,
+            body_text=body_text,
+            segments=segments,
+            voice_spec=default_voice,
+        )
+        chapters.append(chapter)
+
+    return chapters
+
+
+def _build_segments(
+    body_text: str, default_voice: str, request: ConversionRequest,
+    chapter_index: int = 0,
+) -> List[SegmentPlan]:
+    """Build SegmentPlan list for a chapter's body text.
+
+    Handles voice markers (PyQt) and chunks (WebUI).
+    """
+    segments = []
+
+    # Check for chunks (WebUI style)
+    chapter_chunk = request.chapter_chunk
+    if chapter_chunk and chapter_chunk.chunks:
+        # Group chunks by chapter index
+        from abogen.domain.chunk_utils import group_chunks_by_chapter
+
+        chunk_groups = group_chunks_by_chapter(chapter_chunk.chunks)
+        chunks_for_chapter = chunk_groups.get(chapter_index, [])
+
+        for chunk_idx, chunk in enumerate(chunks_for_chapter):
+            chunk_text = chunk.get("normalized_text") or chunk.get("text", "")
+            if not chunk_text or not chunk_text.strip():
+                continue
+
+            chunk_voice = _resolve_chunk_voice(chunk, default_voice, request)
+            speaker_id = chunk.get("speaker_id", "narrator")
+
+            segments.append(
+                SegmentPlan(
+                    text=chunk_text.strip(),
+                    voice_spec=chunk_voice,
+                    kind="body",
+                    speaker_id=speaker_id,
+                    chunk_id=chunk.get("id"),
+                    chunk_index=chunk.get("chunk_index", chunk_idx),
+                    level=chunk.get("level", chapter_chunk.chunk_level),
+                    source="chunk",
+                )
+            )
+        return segments
+
+    # Check for voice markers (PyQt style)
+    # Detect markers even if validation fails (voice names may not be loaded yet)
+    from abogen.domain.voice_markers import _VOICE_MARKER_SEARCH_PATTERN
+
+    has_voice_markers = bool(_VOICE_MARKER_SEARCH_PATTERN.search(body_text))
+    voice_segments, last_voice, valid_count, invalid_count = split_text_by_voice_markers(
+        body_text, default_voice
+    )
+
+    if has_voice_markers or (len(voice_segments) > 1):
+        # Voice markers were used
+        for voice_name, segment_text in voice_segments:
+            if not segment_text or not segment_text.strip():
+                continue
+            segments.append(
+                SegmentPlan(
+                    text=segment_text.strip(),
+                    voice_spec=voice_name,
+                    kind="body",
+                    source="voice_marker",
+                )
+            )
+        return segments
+
+    # No voice markers — single segment for entire body
+    if body_text and body_text.strip():
+        segments.append(
+            SegmentPlan(
+                text=body_text.strip(),
+                voice_spec=default_voice,
+                kind="body",
+                source="chapter",
+            )
+        )
+
+    return segments
+
+
+def _resolve_chunk_voice(
+    chunk: Dict[str, Any], default_voice: str, request: ConversionRequest
+) -> str:
+    """Resolve voice for a chunk."""
+    # Check for speaker-based voice
+    speaker_id = chunk.get("speaker_id", "narrator")
+    speakers = request.chapter_chunk.speakers if request.chapter_chunk else {}
+    if speaker_id and speaker_id != "narrator" and speakers:
+        speaker_config = speakers.get(speaker_id, {})
+        if isinstance(speaker_config, dict):
+            voice = speaker_config.get("voice")
+            if voice:
+                return voice
+
+    # Check for direct voice field
+    voice = chunk.get("voice")
+    if voice:
+        return voice
+
+    return default_voice
+
+
+def _build_intro_outro(
+    metadata: Dict[str, Any], request: ConversionRequest
+) -> Tuple[Optional[IntroOutroSpec], Optional[IntroOutroSpec]]:
+    """Build intro and outro specs."""
+    intro_spec = None
+    outro_spec = None
+
+    # Intro
+    if request.read_title_intro:
+        resolved = resolve_intro(
+            metadata,
+            request.original_filename,
+            True,
+            request.voice or "M1",
+            request.voice or "M1",
+            [],
+        )
+        if resolved.enabled:
+            intro_spec = IntroOutroSpec(
+                enabled=True,
+                text=resolved.text,
+                voice_spec=resolved.voice_spec,
+                kind="intro",
+            )
+
+    # Outro
+    if request.read_closing_outro:
+        resolved = resolve_outro(
+            metadata,
+            request.original_filename,
+            True,
+            request.voice or "M1",
+            request.voice or "M1",
+            [],
+        )
+        if resolved.enabled:
+            outro_spec = IntroOutroSpec(
+                enabled=True,
+                text=resolved.text,
+                voice_spec=resolved.voice_spec,
+                kind="outro",
+            )
+
+    return intro_spec, outro_spec
+
+
+# Output layout resolution is now in application/output_layout_service.py

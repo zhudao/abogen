@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
-import re
 import shutil
 import sys
 import threading
@@ -14,15 +12,13 @@ import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Mapping, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Mapping
 
-from abogen.utils import get_internal_cache_path, get_user_settings_dir, load_config
-from abogen.voice_cache import bootstrap_voice_cache
-from abogen.integrations.audiobookshelf import (
-    AudiobookshelfClient,
-    AudiobookshelfConfig,
-    AudiobookshelfUploadError,
-)
+from abogen.domain.metadata_helpers import normalize_metadata_map
+
+from abogen.domain.enums import Language
+from abogen.utils import console_handler, get_internal_cache_path, get_user_settings_dir
+
 
 
 def _create_set_event() -> threading.Event:
@@ -36,9 +32,7 @@ STATE_VERSION = 8
 
 _JOB_LOGGER = logging.getLogger("abogen.jobs")
 if not _JOB_LOGGER.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
-    _JOB_LOGGER.addHandler(handler)
+    _JOB_LOGGER.addHandler(console_handler())
     _JOB_LOGGER.propagate = False
 _JOB_LOGGER.setLevel(logging.DEBUG)
 
@@ -51,9 +45,6 @@ _JOB_LEVEL_MAP: Dict[str, int] = {
     "debug": logging.DEBUG,
     "trace": logging.DEBUG,
 }
-
-
-_PEOPLE_SPLIT_RE = re.compile(r"[;,/&]|\band\b", re.IGNORECASE)
 
 
 def _emit_job_log(job_id: str, level: str, message: str) -> None:
@@ -99,7 +90,7 @@ class Job:
     id: str
     original_filename: str
     stored_path: Path
-    language: str
+    language: Language
     voice: str
     speed: float
     use_gpu: bool
@@ -131,6 +122,7 @@ class Job:
     progress: float = 0.0
     total_characters: int = 0
     processed_characters: int = 0
+    etr_str: str = ""
     logs: List[JobLog] = field(default_factory=list)
     error: Optional[str] = None
     result: JobResult = field(default_factory=JobResult)
@@ -162,20 +154,25 @@ class Job:
     @property
     def estimated_time_remaining(self) -> Optional[float]:
         """
-        Returns the estimated seconds remaining based on current progress and elapsed time.
-        Returns None if the job hasn't started, is finished, or progress is 0.
+        Returns the estimated seconds remaining.
+        Uses the same calc_etr_str from domain/progress.py as the PyQt desktop GUI.
         """
-        if self.status != JobStatus.RUNNING or not self.started_at or self.progress <= 0:
+        from abogen.domain.progress import calc_etr_str
+
+        if self.status != JobStatus.RUNNING or not self.started_at or self.total_characters <= 0:
             return None
-        
+
         elapsed = time.time() - self.started_at
         if elapsed <= 0:
             return None
-            
-        # Estimate total time based on current progress
-        total_estimated = elapsed / self.progress
-        remaining = total_estimated - elapsed
-        return max(0.0, remaining)
+
+        etr = calc_etr_str(elapsed, self.processed_characters, self.total_characters)
+        if etr == "Processing...":
+            return None
+
+        # Parse "HH:MM:SS" back to seconds for backward compatibility
+        parts = etr.split(":")
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
 
     def add_log(self, message: str, level: str = "info") -> None:
         entry = JobLog(timestamp=time.time(), message=message, level=level)
@@ -194,6 +191,7 @@ class Job:
             "progress": self.progress,
             "total_characters": self.total_characters,
             "processed_characters": self.processed_characters,
+            "etr_str": self.etr_str,
             "error": self.error,
             "logs": [log.__dict__ for log in self.logs],
             "result": {
@@ -252,269 +250,6 @@ class Job:
         }
 
 
-def _normalize_metadata_casefold(values: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    normalized: Dict[str, Any] = {}
-    if not values:
-        return normalized
-    for key, value in values.items():
-        if value is None:
-            continue
-        key_text = str(key).strip().lower()
-        if not key_text:
-            continue
-        if isinstance(value, (list, tuple, set)):
-            normalized[key_text] = value
-        else:
-            text = str(value).strip()
-            if text:
-                normalized[key_text] = text
-    return normalized
-
-
-def _split_people_field(raw: Any) -> List[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, (list, tuple, set)):
-        results: List[str] = []
-        for item in raw:
-            results.extend(_split_people_field(item))
-        return results
-    text = str(raw or "").strip()
-    if not text:
-        return []
-    tokens = [_token.strip() for _token in _PEOPLE_SPLIT_RE.split(text) if _token.strip()]
-    seen: set[str] = set()
-    ordered: List[str] = []
-    for token in tokens:
-        key = token.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered.append(token)
-    return ordered
-
-
-_LIST_SPLIT_RE = re.compile(r"[;,\n]")
-_SERIES_SEQUENCE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
-
-_SERIES_SEQUENCE_TAG_KEYS: Tuple[str, ...] = (
-    "series_index",
-    "series_position",
-    "series_sequence",
-    "series_number",
-    "seriesnumber",
-    "book_number",
-    "booknumber",
-)
-
-
-def _split_simple_list(raw: Any) -> List[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, (list, tuple, set)):
-        results: List[str] = []
-        for item in raw:
-            results.extend(_split_simple_list(item))
-        return results
-    text = str(raw or "").strip()
-    if not text:
-        return []
-    tokens = [_token.strip() for _token in _LIST_SPLIT_RE.split(text) if _token.strip()]
-    seen: set[str] = set()
-    ordered: List[str] = []
-    for token in tokens:
-        key = token.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered.append(token)
-    return ordered
-
-
-def _first_nonempty(*values: Any) -> Optional[str]:
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, (list, tuple, set)):
-            items = list(value)
-            if not items:
-                continue
-            value = items[0]
-        text = str(value).strip()
-        if text:
-            return text
-    return None
-
-
-def _extract_year(raw: Optional[str]) -> Optional[int]:
-    if not raw:
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    match = re.search(r"(19|20)\d{2}", text)
-    if match:
-        try:
-            return int(match.group(0))
-        except ValueError:
-            return None
-    try:
-        parsed = int(text)
-    except ValueError:
-        return None
-    if 0 < parsed < 3000:
-        return parsed
-    return None
-
-
-def build_audiobookshelf_metadata(job: Job) -> Dict[str, Any]:
-    tags = _normalize_metadata_casefold(job.metadata_tags)
-    filename = Path(job.original_filename or "").stem or job.original_filename or "Audiobook"
-    title = _first_nonempty(
-        tags.get("title"),
-        tags.get("book_title"),
-        tags.get("name"),
-        tags.get("album"),
-        filename,
-    )
-    authors = _split_people_field(
-        tags.get("authors")
-        or tags.get("author")
-        or tags.get("album_artist")
-        or tags.get("artist")
-    )
-    narrators = _split_people_field(tags.get("narrators") or tags.get("narrator"))
-    description = _first_nonempty(tags.get("description"), tags.get("summary"), tags.get("comment"))
-    genres = _split_simple_list(tags.get("genre"))
-    keywords = _split_simple_list(tags.get("tags") or tags.get("keywords"))
-    language = _first_nonempty(tags.get("language"), tags.get("lang")) or job.language or ""
-    series_name = _first_nonempty(
-        tags.get("series"),
-        tags.get("series_name"),
-        tags.get("seriesname"),
-        tags.get("series_title"),
-        tags.get("seriestitle"),
-    )
-    
-    series_sequence = None
-    for key in _SERIES_SEQUENCE_TAG_KEYS:
-        raw_value = tags.get(key)
-        normalized_sequence = _normalize_series_sequence(raw_value)
-        if normalized_sequence:
-            series_sequence = normalized_sequence
-            break
-    if not series_name:
-        series_sequence = None
-    data: Dict[str, Any] = {
-        "title": title,
-        "subtitle": tags.get("subtitle"),
-        "authors": authors,
-        "narrators": narrators,
-        "description": description,
-        "publisher": tags.get("publisher"),
-        "genres": genres,
-        "tags": keywords,
-        "language": language,
-        "publishedYear": _extract_year(tags.get("published") or tags.get("publication_year") or tags.get("date") or tags.get("year")),
-        "seriesName": series_name,
-        "seriesSequence": series_sequence,
-        "isbn": _first_nonempty(tags.get("isbn"), tags.get("asin")),
-    }
-    published_date = _first_nonempty(tags.get("published"), tags.get("publication_date"), tags.get("date"))
-    if published_date:
-        data["publishedDate"] = published_date
-
-    rating_text = _first_nonempty(tags.get("rating"), tags.get("my_rating"))
-    if rating_text:
-        try:
-            data["rating"] = float(str(rating_text).strip())
-        except ValueError:
-            pass
-        rating_max_text = _first_nonempty(tags.get("rating_max"), tags.get("rating_scale"))
-        if rating_max_text:
-            try:
-                data["ratingMax"] = float(str(rating_max_text).strip())
-            except ValueError:
-                pass
-    # Remove empty values
-    cleaned: Dict[str, Any] = {}
-    for key, value in data.items():
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        if isinstance(value, (list, tuple)) and not value:
-            continue
-        cleaned[key] = value
-    return cleaned
-
-
-def _normalize_series_sequence(raw: Any) -> Optional[str]:
-    if raw is None:
-        return None
-
-    if isinstance(raw, (int, float)):
-        if isinstance(raw, float) and (math.isnan(raw) or math.isinf(raw)):
-            return None
-        text = str(raw)
-    else:
-        text = str(raw).strip()
-
-    if not text:
-        return None
-
-    candidate = text.replace(",", ".")
-    match = _SERIES_SEQUENCE_NUMBER_RE.search(candidate)
-    if not match:
-        return None
-
-    normalized = match.group(0)
-    if "." in normalized:
-        normalized = normalized.rstrip("0").rstrip(".")
-        if not normalized:
-            normalized = "0"
-        return normalized
-
-    try:
-        return str(int(normalized))
-    except ValueError:
-        cleaned = normalized.lstrip("0")
-        return cleaned or "0"
-
-
-def load_audiobookshelf_chapters(job: Job) -> Optional[List[Dict[str, Any]]]:
-    metadata_ref = job.result.artifacts.get("metadata")
-    if not metadata_ref:
-        return None
-    metadata_path = metadata_ref if isinstance(metadata_ref, Path) else Path(str(metadata_ref))
-    if not metadata_path.exists():
-        return None
-    try:
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    chapters = payload.get("chapters")
-    if not isinstance(chapters, list):
-        return None
-    cleaned: List[Dict[str, Any]] = []
-    for entry in chapters:
-        if not isinstance(entry, Mapping):
-            continue
-        title = _first_nonempty(entry.get("title"), entry.get("original_title"))
-        start = entry.get("start")
-        end = entry.get("end")
-        if title is None or not isinstance(start, (int, float)):
-            continue
-        chapter_payload: Dict[str, Any] = {
-            "title": title,
-            "start": float(start),
-        }
-        if isinstance(end, (int, float)):
-            chapter_payload["end"] = float(end)
-        cleaned.append(chapter_payload)
-    return cleaned or None
-
-
 def _existing_paths(paths: Iterable[Any]) -> List[Path]:
     resolved: List[Path] = []
     for item in paths:
@@ -529,7 +264,7 @@ class PendingJob:
     id: str
     original_filename: str
     stored_path: Path
-    language: str
+    language: Language
     voice: str
     speed: float
     use_gpu: bool
@@ -600,7 +335,6 @@ class ConversionService:
         self._pending_jobs: Dict[str, PendingJob] = {}
         self._state_path = self._determine_state_path()
         self._ensure_directories()
-        self._bootstrap_voice_cache()
         self._load_state()
 
     # Public API ---------------------------------------------------------
@@ -617,7 +351,7 @@ class ConversionService:
         *,
         original_filename: str,
         stored_path: Path,
-        language: str,
+        language: Language,
         voice: str,
         speed: float,
         tts_provider: str = "kokoro",
@@ -661,7 +395,7 @@ class ConversionService:
         normalization_overrides: Optional[Mapping[str, Any]] = None,
     ) -> Job:
         job_id = uuid.uuid4().hex
-        normalized_metadata = self._normalize_metadata_tags(metadata_tags)
+        normalized_metadata = normalize_metadata_map(metadata_tags)
         normalized_chapters = self._normalize_chapters(chapters)
         normalized_chunks = self._normalize_chunks(chunks)
         if total_characters <= 0 and normalized_chapters:
@@ -930,23 +664,6 @@ class ConversionService:
         self._uploads_root.mkdir(parents=True, exist_ok=True)
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _bootstrap_voice_cache(self) -> None:
-        try:
-            downloaded, errors = bootstrap_voice_cache(
-                on_progress=lambda msg: _JOB_LOGGER.debug("[voice cache] %s", msg)
-            )
-        except RuntimeError as exc:
-            _JOB_LOGGER.warning("Voice cache bootstrap skipped: %s", exc)
-            return
-
-        if downloaded:
-            count = len(downloaded)
-            suffix = "s" if count != 1 else ""
-            _JOB_LOGGER.info("Voice cache ready: downloaded %d new asset%s.", count, suffix)
-        if errors:
-            for voice_id, message in errors.items():
-                _JOB_LOGGER.warning("Voice cache failed for %s: %s", voice_id, message)
-
     def _ensure_worker(self) -> None:
         with self._lock:
             if self._worker_thread and self._worker_thread.is_alive():
@@ -1013,7 +730,6 @@ class ConversionService:
             elif job.status != JobStatus.FAILED:
                 job.status = JobStatus.COMPLETED
                 job.add_log("Job completed", level="success")
-                self._post_completion_hooks(job)
             job.finished_at = time.time()
         finally:
             job.pause_event.set()
@@ -1034,105 +750,6 @@ class ConversionService:
             self._queue.remove(job_id)
         self._update_queue_positions_locked()
 
-    def _post_completion_hooks(self, job: Job) -> None:
-        try:
-            self._maybe_send_to_audiobookshelf(job)
-        except AudiobookshelfUploadError as exc:
-            job.add_log(f"Audiobookshelf upload failed: {exc}", level="error")
-        except Exception as exc:  # pragma: no cover - defensive guard
-            job.add_log(f"Audiobookshelf integration error: {exc}", level="error")
-
-    def _maybe_send_to_audiobookshelf(self, job: Job) -> None:
-        cfg = load_config() or {}
-        integration_cfg = cfg.get("audiobookshelf")
-        if not isinstance(integration_cfg, Mapping):
-            return
-        enabled = self._coerce_bool(integration_cfg.get("enabled"), False)
-        auto_send = self._coerce_bool(integration_cfg.get("auto_send"), False)
-        if not (enabled and auto_send):
-            return
-
-        base_url = str(integration_cfg.get("base_url") or "").strip()
-        api_token = str(integration_cfg.get("api_token") or "").strip()
-        library_id = str(integration_cfg.get("library_id") or "").strip()
-        folder_id = str(integration_cfg.get("folder_id") or "").strip()
-        if not base_url or not api_token or not library_id:
-            job.add_log(
-                "Audiobookshelf upload skipped: configure base URL, API token, and library ID first.",
-                level="warning",
-            )
-            return
-        if not folder_id:
-            job.add_log(
-                "Audiobookshelf upload skipped: enter the folder name or ID in the Audiobookshelf settings.",
-                level="warning",
-            )
-            return
-
-        audio_ref = job.result.audio_path
-        audio_path = audio_ref if isinstance(audio_ref, Path) else Path(str(audio_ref)) if audio_ref else None
-        if not audio_path or not audio_path.exists():
-            job.add_log("Audiobookshelf upload skipped: audio output not found.", level="warning")
-            return
-
-        timeout_raw = integration_cfg.get("timeout", 3600.0)
-        try:
-            timeout_value = float(timeout_raw)
-        except (TypeError, ValueError):
-            timeout_value = 3600.0
-
-        config = AudiobookshelfConfig(
-            base_url=base_url,
-            api_token=api_token,
-            library_id=library_id,
-            collection_id=(str(integration_cfg.get("collection_id") or "").strip() or None),
-            folder_id=folder_id,
-            verify_ssl=self._coerce_bool(integration_cfg.get("verify_ssl"), True),
-            send_cover=self._coerce_bool(integration_cfg.get("send_cover"), True),
-            send_chapters=self._coerce_bool(integration_cfg.get("send_chapters"), True),
-            send_subtitles=self._coerce_bool(integration_cfg.get("send_subtitles"), False),
-            timeout=timeout_value,
-        )
-
-        cover_ref = job.cover_image_path
-        cover_path = None
-        if config.send_cover and cover_ref:
-            cover_candidate = cover_ref if isinstance(cover_ref, Path) else Path(str(cover_ref))
-            if cover_candidate.exists():
-                cover_path = cover_candidate
-
-        subtitles = _existing_paths(job.result.subtitle_paths) if config.send_subtitles else None
-        chapters = load_audiobookshelf_chapters(job) if config.send_chapters else None
-        metadata = build_audiobookshelf_metadata(job)
-
-        client = AudiobookshelfClient(config)
-
-        display_title = metadata.get("title") or audio_path.stem
-        try:
-            existing_items = client.find_existing_items(display_title, folder_id=config.folder_id)
-        except AudiobookshelfUploadError as exc:
-            job.add_log(f"Audiobookshelf lookup failed: {exc}", level="error")
-            return
-
-        if existing_items:
-            job.add_log(
-                f"Removing existing Audiobookshelf item(s) for '{display_title}' before upload.",
-                level="info",
-            )
-            try:
-                client.delete_items(existing_items)
-            except Exception as exc:
-                job.add_log(f"Failed to remove existing item(s): {exc}", level="warning")
-
-        client.upload_audiobook(
-            audio_path,
-            metadata=metadata,
-            cover_path=cover_path,
-            chapters=chapters,
-            subtitles=subtitles,
-        )
-        job.add_log("Audiobookshelf upload queued.", level="info")
-
     # Persistence ------------------------------------------------------
     def _serialize_job(self, job: Job) -> Dict[str, Any]:
         result_audio = str(job.result.audio_path) if job.result.audio_path else None
@@ -1143,7 +760,7 @@ class ConversionService:
             "id": job.id,
             "original_filename": job.original_filename,
             "stored_path": str(job.stored_path),
-            "language": job.language,
+            "language": job.language.value if isinstance(job.language, Language) else str(job.language),
             "tts_provider": getattr(job, "tts_provider", "kokoro"),
             "voice": job.voice,
             "speed": job.speed,
@@ -1259,11 +876,19 @@ class ConversionService:
         stored_path = Path(payload["stored_path"])
         output_folder_raw = payload.get("output_folder")
         output_folder = Path(output_folder_raw) if output_folder_raw else None
+        raw_lang = payload.get("language", "")
+        if isinstance(raw_lang, Language):
+            language = raw_lang
+        else:
+            try:
+                language = Language.from_str(str(raw_lang or "").strip())
+            except (ValueError, AttributeError):
+                language = Language.EN_US
         job = Job(
             id=payload["id"],
             original_filename=payload["original_filename"],
             stored_path=stored_path,
-            language=payload.get("language", "a"),
+            language=language,
             tts_provider=str(payload.get("tts_provider") or "kokoro"),
             voice=payload.get("voice", ""),
             speed=float(payload.get("speed", 1.0)),
@@ -1410,20 +1035,6 @@ class ConversionService:
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _normalize_metadata_tags(values: Optional[Mapping[str, Any]]) -> Dict[str, str]:
-        if not values:
-            return {}
-        normalized: Dict[str, str] = {}
-        for key, raw_value in values.items():
-            if raw_value is None:
-                continue
-            key_str = str(key).strip()
-            if not key_str:
-                continue
-            normalized[key_str] = str(raw_value)
-        return normalized
-
     @classmethod
     def _normalize_chapters(cls, chapters: Optional[Iterable[Any]]) -> List[Dict[str, Any]]:
         if not chapters:
@@ -1500,7 +1111,7 @@ class ConversionService:
             entry["enabled"] = enabled
 
             metadata_payload = raw_dict.get("metadata") or raw_dict.get("metadata_tags")
-            normalized_metadata = cls._normalize_metadata_tags(metadata_payload)
+            normalized_metadata = normalize_metadata_map(metadata_payload)
             if normalized_metadata:
                 entry["metadata"] = normalized_metadata
 
@@ -1609,10 +1220,12 @@ def build_service(
     output_root: Optional[Path] = None,
     uploads_root: Optional[Path] = None,
 ) -> ConversionService:
+    global _service_instance
     output_root = output_root or default_storage_root()
     service = ConversionService(
         output_root=output_root,
         uploads_root=uploads_root,
         runner=runner,
     )
+    _service_instance = service
     return service

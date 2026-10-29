@@ -1,7 +1,7 @@
 import re
-import platform
 from abogen.utils import detect_encoding, load_config
 from abogen.constants import SAMPLE_VOICE_TEXTS
+from abogen.domain.enums import Language
 
 # Pre-compile frequently used regex patterns for better performance
 _METADATA_TAG_PATTERN = re.compile(r"<<METADATA_[^:]+:[^>]*>>")
@@ -23,13 +23,6 @@ _VTT_NOTE_PATTERN = re.compile(r"NOTE\s*\n.*?(?=\n\n|$)", re.DOTALL)
 _DOUBLE_NEWLINE_SPLIT_PATTERN = re.compile(r"\n\s*\n")
 _VTT_TIMESTAMP_PATTERN = re.compile(r"([\d:.]+)\s*-->\s*([\d:.]+)")
 _TIMESTAMP_ONLY_PATTERN = re.compile(r"^(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?)$")
-_WINDOWS_ILLEGAL_CHARS_PATTERN = re.compile(r'[<>:"/\\|?*]')
-_CONTROL_CHARS_PATTERN = re.compile(r"[\x00-\x1f]")
-_LINUX_CONTROL_CHARS_PATTERN = re.compile(
-    r"[\x01-\x1f]"
-)  # Linux: exclude \x00 for separate handling
-_MACOS_ILLEGAL_CHARS_PATTERN = re.compile(r"[:]")
-_LINUX_ILLEGAL_CHARS_PATTERN = re.compile(r"[/\x00]")
 
 
 def clean_subtitle_text(text):
@@ -41,17 +34,6 @@ def clean_subtitle_text(text):
     return text.strip()
 
 
-def calculate_text_length(text):
-    # Use pre-compiled patterns for better performance
-    # Ignore chapter markers, voice markers, and metadata patterns in a single pass
-    text = _CHAPTER_MARKER_PATTERN.sub("", text)
-    text = _VOICE_MARKER_PATTERN.sub("", text)
-    text = _METADATA_TAG_PATTERN.sub("", text)
-    # Ignore newlines and leading/trailing spaces
-    text = text.replace("\n", "").strip()
-    # Calculate character count
-    char_count = len(text)
-    return char_count
 
 
 def clean_text(text, *args, **kwargs):
@@ -396,189 +378,27 @@ def parse_ass_file(file_path):
     return subtitles
 
 
-def get_sample_voice_text(lang_code):
-    return SAMPLE_VOICE_TEXTS.get(lang_code, SAMPLE_VOICE_TEXTS["a"])
-
-
-def sanitize_name_for_os(name, is_folder=True):
-    """
-    Sanitize a filename or folder name based on the operating system.
+def get_sample_voice_text(language):
+    """Get sample voice text for a language.
 
     Args:
-        name: The name to sanitize
-        is_folder: Whether this is a folder name (default: True)
-
-    Returns:
-        Sanitized name safe for the current OS
+        language: Language enum value or string (for backward compatibility).
     """
-    if not name:
-        return "audiobook"
-
-    system = platform.system()
-
-    if system == "Windows":
-        # Windows illegal characters: < > : " / \ | ? *
-        # Also can't end with space or dot
-        # Use pre-compiled pattern for better performance
-        sanitized = _WINDOWS_ILLEGAL_CHARS_PATTERN.sub("_", name)
-        # Remove control characters (0-31)
-        sanitized = _CONTROL_CHARS_PATTERN.sub("_", sanitized)
-        # Remove trailing spaces and dots
-        sanitized = sanitized.rstrip(". ")
-        # Windows reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
-        reserved = (
-            ["CON", "PRN", "AUX", "NUL"]
-            + [f"COM{i}" for i in range(1, 10)]
-            + [f"LPT{i}" for i in range(1, 10)]
-        )
-        if sanitized.upper() in reserved or sanitized.upper().split(".")[0] in reserved:
-            sanitized = f"_{sanitized}"
-    elif system == "Darwin":  # macOS
-        # macOS illegal characters: : (colon is converted to / by the system)
-        # Also can't start with dot (hidden file) for folders typically
-        # Use pre-compiled pattern for better performance
-        sanitized = _MACOS_ILLEGAL_CHARS_PATTERN.sub("_", name)
-        # Remove control characters
-        sanitized = _CONTROL_CHARS_PATTERN.sub("_", sanitized)
-        # Avoid leading dot for folders (creates hidden folders)
-        if is_folder and sanitized.startswith("."):
-            sanitized = "_" + sanitized[1:]
-    else:  # Linux and others
-        # Linux illegal characters: / and null character
-        # Though / is illegal, most other chars are technically allowed
-        # Use pre-compiled pattern for better performance
-        sanitized = _LINUX_ILLEGAL_CHARS_PATTERN.sub("_", name)
-        # Remove other control characters for safety (excluding \x00 which is already handled)
-        sanitized = _LINUX_CONTROL_CHARS_PATTERN.sub("_", sanitized)
-        # Avoid leading dot for folders (creates hidden folders)
-        if is_folder and sanitized.startswith("."):
-            sanitized = "_" + sanitized[1:]
-
-    # Ensure the name is not empty after sanitization
-    if not sanitized or sanitized.strip() == "":
-        sanitized = "audiobook"
-
-    # Limit length to 255 characters (common limit across filesystems)
-    if len(sanitized) > 255:
-        sanitized = sanitized[:255].rstrip(". ")
-
-    return sanitized
+    if isinstance(language, str):
+        try:
+            language = Language.from_str(language)
+        except (ValueError, AttributeError):
+            language = Language.EN_US
+    return SAMPLE_VOICE_TEXTS.get(language, SAMPLE_VOICE_TEXTS[Language.EN_US])
 
 
-def validate_voice_name(voice_name):
-    """Validate voice name against VOICES_INTERNAL list (case-insensitive).
-    Handles both single voices and formulas like 'af_heart*0.5 + am_echo*0.5'.
+# Backward-compatible re-exports — canonical location is domain/output_paths.py
+from abogen.domain.output_paths import sanitize_name_for_os  # noqa: E402, F401
 
-    Args:
-        voice_name: Voice name or formula string to validate
-
-    Returns:
-        Tuple of (is_valid, invalid_voice_name):
-            - is_valid: True if all voices in the name/formula are valid
-            - invalid_voice_name: The first invalid voice found, or None if all valid
-    """
-    from abogen.constants import VOICES_INTERNAL
-
-    # Create case-insensitive lookup set (done once per call)
-    voice_lookup_lower = {v.lower() for v in VOICES_INTERNAL}
-    voice_name = voice_name.strip()
-
-    # Check if it's a formula (contains *)
-    if "*" in voice_name:
-        # Extract voice names from formula
-        voices = voice_name.split("+")
-        for term in voices:
-            if "*" in term:
-                base_voice = term.split("*")[0].strip()
-                # Case-insensitive comparison
-                if base_voice.lower() not in voice_lookup_lower:
-                    return False, base_voice
-        return True, None
-    else:
-        # Single voice - case-insensitive comparison
-        if voice_name.lower() not in voice_lookup_lower:
-            return False, voice_name
-        return True, None
-
-
-def split_text_by_voice_markers(text, default_voice):
-    """Split text by voice markers, returning list of (voice, text) tuples.
-
-    IMPORTANT: Returns the last voice used so it can persist across chapters.
-    Voice names are normalized to lowercase to match VOICES_INTERNAL.
-
-    Args:
-        text: Text potentially containing <<VOICE:name>> markers
-        default_voice: Voice to use if no markers found or before first marker
-
-    Returns:
-        Tuple of (segments_list, last_voice_used, valid_count, invalid_count):
-            - segments_list: List of (voice_name, segment_text) tuples
-            - last_voice_used: The voice that should continue into next chapter
-            - valid_count: Number of valid voice markers processed
-            - invalid_count: Number of invalid voice markers skipped
-    """
-    from abogen.constants import VOICES_INTERNAL
-
-    voice_splits = list(_VOICE_MARKER_SEARCH_PATTERN.finditer(text))
-
-    if not voice_splits:
-        # No voice markers, return entire text with default voice
-        return [(default_voice, text)], default_voice, 0, 0
-
-    segments = []
-    current_voice = default_voice
-    valid_markers = 0
-    invalid_markers = 0
-
-    # Text before first marker uses default voice
-    first_start = voice_splits[0].start()
-    if first_start > 0:
-        intro_text = text[:first_start].strip()
-        if intro_text:
-            segments.append((current_voice, intro_text))
-
-    # Process each voice marker
-    for idx, match in enumerate(voice_splits):
-        voice_name = match.group(1).strip()
-        start = match.end()
-        end = voice_splits[idx + 1].start() if idx + 1 < len(voice_splits) else len(text)
-        segment_text = text[start:end].strip()
-
-        # Validate voice name
-        is_valid, invalid_voice = validate_voice_name(voice_name)
-        if is_valid:
-            # Normalize to lowercase to match canonical form
-            # Handle both single voices and formulas
-            if "*" in voice_name:
-                # Normalize each voice in the formula
-                normalized_parts = []
-                for part in voice_name.split("+"):
-                    part = part.strip()
-                    if "*" in part:
-                        voice_part, weight = part.split("*", 1)
-                        # Find the canonical (lowercase) voice name
-                        voice_part_lower = voice_part.strip().lower()
-                        canonical_voice = next(
-                            (v for v in VOICES_INTERNAL if v.lower() == voice_part_lower),
-                            voice_part.strip()
-                        )
-                        normalized_parts.append(f"{canonical_voice}*{weight.strip()}")
-                current_voice = " + ".join(normalized_parts)
-            else:
-                # Find the canonical (lowercase) voice name
-                voice_name_lower = voice_name.lower()
-                current_voice = next(
-                    (v for v in VOICES_INTERNAL if v.lower() == voice_name_lower),
-                    voice_name
-                )
-            valid_markers += 1
-        else:
-            # Invalid voice - stay with previous voice
-            invalid_markers += 1
-
-        if segment_text:
-            segments.append((current_voice, segment_text))
-
-    # Return segments, last voice, and counts
-    return segments, current_voice, valid_markers, invalid_markers
+# Backward-compatible re-exports — canonical location is domain/voice_markers.py
+from abogen.domain.voice_markers import (  # noqa: E402, F401
+    validate_voice_name,
+    split_text_by_voice_markers,
+    _VOICE_MARKER_PATTERN,
+    _VOICE_MARKER_SEARCH_PATTERN,
+)

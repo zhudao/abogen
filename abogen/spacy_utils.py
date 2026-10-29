@@ -2,23 +2,24 @@
 Lazy-loaded spaCy utilities for sentence segmentation.
 """
 
+from abogen.domain.enums import Language
+
 # Cached spaCy module and models (lazy loaded)
 _spacy = None
 _nlp_cache = {}
 
 # Language code to spaCy model mapping
 SPACY_MODELS = {
-    "a": "en_core_web_sm",  # American English
-    "b": "en_core_web_sm",  # British English
-    "e": "es_core_news_sm",  # Spanish
-    "f": "fr_core_news_sm",  # French
-    "i": "it_core_news_sm",  # Italian
-    "p": "pt_core_news_sm",  # Brazilian Portuguese
-    "z": "zh_core_web_sm",  # Mandarin Chinese
-    "j": "ja_core_news_sm",  # Japanese
-    "h": "xx_sent_ud_sm",  # Hindi (multi-language model)
+    Language.EN_US: "en_core_web_sm",
+    Language.EN_GB: "en_core_web_sm",
+    Language.ES: "es_core_news_sm",
+    Language.FR: "fr_core_news_sm",
+    Language.IT: "it_core_news_sm",
+    Language.PT_BR: "pt_core_news_sm",
+    Language.ZH: "zh_core_web_sm",
+    Language.JA: "ja_core_news_sm",
+    Language.HI: "xx_sent_ud_sm",
 }
-
 
 def _load_spacy():
     """Lazy load spaCy module."""
@@ -33,13 +34,12 @@ def _load_spacy():
     return _spacy
 
 
-def get_spacy_model(lang_code, log_callback=None):
+def get_spacy_model(language: Language, log_callback=None):
     """
-    Get or load a spaCy model for the given language code.
-    Downloads the model automatically if not available.
+    Get or load a spaCy model for the given language.
 
     Args:
-        lang_code: Language code (a, b, e, f, etc.)
+        language: Language enum value.
         log_callback: Optional function to log messages
 
     Returns:
@@ -47,25 +47,26 @@ def get_spacy_model(lang_code, log_callback=None):
     """
 
     def log(msg, is_error=False):
-        # Prefer GUI log callback when provided to avoid spamming stdout.
         if log_callback:
             color = "red" if is_error else "grey"
             try:
                 log_callback((msg, color))
             except Exception:
-                # Fallback to printing if callback misbehaves
                 print(msg)
         else:
             print(msg)
 
-    # Check if model is cached
-    if lang_code in _nlp_cache:
-        return _nlp_cache[lang_code]
+    if not isinstance(language, Language):
+        raise TypeError(
+            f"language must be Language enum, got {type(language).__name__}: {language!r}"
+        )
 
-    # Check if language is supported
-    model_name = SPACY_MODELS.get(lang_code)
+    if language in _nlp_cache:
+        return _nlp_cache[language]
+
+    model_name = SPACY_MODELS.get(language)
     if not model_name:
-        log(f"\nspaCy: No model mapping for language '{lang_code}'...")
+        log(f"\nspaCy: No model mapping for language '{language}'...")
         return None
 
     # Lazy load spaCy
@@ -89,7 +90,7 @@ def get_spacy_model(lang_code, log_callback=None):
         if "parser" not in nlp.pipe_names and "sentencizer" not in nlp.pipe_names:
             nlp.add_pipe("sentencizer")
 
-        _nlp_cache[lang_code] = nlp
+        _nlp_cache[language] = nlp
         return nlp
     except OSError:
         # Model not found, attempt download
@@ -106,7 +107,7 @@ def get_spacy_model(lang_code, log_callback=None):
             if "parser" not in nlp.pipe_names and "sentencizer" not in nlp.pipe_names:
                 nlp.add_pipe("sentencizer")
 
-            _nlp_cache[lang_code] = nlp
+            _nlp_cache[language] = nlp
             log(f"spaCy model '{model_name}' downloaded and loaded")
             return nlp
         except Exception as e:
@@ -120,19 +121,19 @@ def get_spacy_model(lang_code, log_callback=None):
         return None
 
 
-def segment_sentences(text, lang_code, log_callback=None):
+def segment_sentences(text, language: Language, log_callback=None):
     """
     Segment text into sentences using spaCy.
 
     Args:
         text: Text to segment
-        lang_code: Language code
+        language: Language enum value
         log_callback: Optional function to log messages
 
     Returns:
         List of sentence strings, or None if spaCy unavailable
     """
-    nlp = get_spacy_model(lang_code, log_callback)
+    nlp = get_spacy_model(language, log_callback)
     if nlp is None:
         return None
 

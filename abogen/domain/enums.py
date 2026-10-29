@@ -1,0 +1,231 @@
+"""Domain enums — typed constants for values tied to business logic.
+
+Using Enum instead of bare strings ensures:
+- Invalid values are caught at construction time
+- IDE autocomplete and type checking work
+- Adding new values is explicit (must update Enum)
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from pathlib import Path
+
+
+class SubtitleMode(str, Enum):
+    """Subtitle generation mode."""
+    DISABLED = "Disabled"
+    LINE = "Line"
+    SENTENCE = "Sentence"
+    SENTENCE_COMMA = "Sentence + Comma"
+    SENTENCE_HIGHLIGHT = "Sentence + Highlighting"
+
+    @classmethod
+    def from_str(cls, value: str) -> SubtitleMode:
+        """Parse from user input: case-insensitive, strips whitespace."""
+        normalized = value.strip()
+        for member in cls:
+            if member.value.lower() == normalized.lower():
+                return member
+        raise ValueError(f"Invalid SubtitleMode: {value!r}. Valid: {[m.value for m in cls]}")
+
+
+class OutputFormat(str, Enum):
+    """Audio output format."""
+    WAV = "wav"
+    MP3 = "mp3"
+    FLAC = "flac"
+    OPUS = "opus"
+    M4B = "m4b"
+
+    @property
+    def dot_ext(self) -> str:
+        """File extension with dot: '.wav', '.mp3', etc."""
+        return f".{self.value}"
+
+    @property
+    def is_lossless(self) -> bool:
+        """True for lossless formats."""
+        return self in (self.WAV, self.FLAC)
+
+    @classmethod
+    def from_str(cls, value: str) -> OutputFormat:
+        """Parse from user input: strips dot prefix, case-insensitive."""
+        normalized = value.strip().lstrip(".").lower()
+        for member in cls:
+            if member.value == normalized:
+                return member
+        raise ValueError(f"Invalid OutputFormat: {value!r}. Valid: {[m.value for m in cls]}")
+
+
+class SaveMode(str, Enum):
+    """Where to save the output file."""
+    SAVE_NEXT_TO_INPUT = "save_next_to_input"
+    SAVE_TO_DESKTOP = "save_to_desktop"
+    CHOOSE_OUTPUT_FOLDER = "choose_output_folder"
+    DEFAULT_OUTPUT = "default_output"
+    CUSTOM_FOLDER = "custom_folder"
+
+
+class SubtitleFormat(str, Enum):
+    """Subtitle file format."""
+    SRT = "srt"
+    ASS = "ass"
+    VTT = "vtt"
+
+    @property
+    def dot_ext(self) -> str:
+        """File extension with dot: '.srt', '.ass'."""
+        return f".{self.value}"
+
+    @classmethod
+    def from_str(cls, value: str) -> SubtitleFormat:
+        """Parse from user input: strips dot prefix, case-insensitive."""
+        normalized = value.strip().lstrip(".").lower()
+        for member in cls:
+            if member.value == normalized:
+                return member
+        raise ValueError(f"Invalid SubtitleFormat: {value!r}. Valid: {[m.value for m in cls]}")
+
+
+class InputFormat(str, Enum):
+    """Input file format."""
+    EPUB = "epub"
+    PDF = "pdf"
+    TXT = "txt"
+    MD = "md"
+    SRT = "srt"
+    ASS = "ass"
+    VTT = "vtt"
+
+    @property
+    def is_book(self) -> bool:
+        """True for book/document formats (epub, pdf, txt, md)."""
+        return self in (self.EPUB, self.PDF, self.TXT, self.MD)
+
+    @property
+    def is_subtitle(self) -> bool:
+        """True for subtitle formats (srt, ass, vtt)."""
+        return self in (self.SRT, self.ASS, self.VTT)
+
+    @property
+    def dot_ext(self) -> str:
+        """File extension with dot: '.epub', '.srt', etc."""
+        return f".{self.value}"
+
+    @classmethod
+    def from_path(cls, path: Path) -> InputFormat:
+        """Detect format from file path extension."""
+        suffix = path.suffix.lower().lstrip(".")
+        if suffix == "markdown":
+            return cls.MD
+        try:
+            return cls(suffix)
+        except ValueError:
+            raise ValueError(f"Unsupported input format: {path.suffix!r}. Supported: {[m.value for m in cls]}")
+
+
+class Language(str, Enum):
+    """TTS language code (ISO 639-1 with region where needed).
+
+    Each engine maps these to its own internal language identifiers.
+    Engines report which languages they support via ``supported_languages()``.
+    """
+    EN_US = "en-US"
+    EN_GB = "en-GB"
+    ES = "es"
+    FR = "fr"
+    HI = "hi"
+    IT = "it"
+    JA = "ja"
+    PT_BR = "pt-BR"
+    ZH = "zh"
+    AR = "ar"
+    BG = "bg"
+    CS = "cs"
+    DA = "da"
+    DE = "de"
+    EL = "el"
+    ET = "et"
+    FI = "fi"
+    HR = "hr"
+    HU = "hu"
+    ID = "id"
+    KO = "ko"
+    LT = "lt"
+    LV = "lv"
+    NL = "nl"
+    PL = "pl"
+    RO = "ro"
+    RU = "ru"
+    SK = "sk"
+    SL = "sl"
+    SV = "sv"
+    TR = "tr"
+    UK = "uk"
+    VI = "vi"
+
+    @property
+    def display_name(self) -> str:
+        """Human-readable language name."""
+        _names = {
+            "en-US": "American English",
+            "en-GB": "British English",
+            "es": "Spanish",
+            "fr": "French",
+            "hi": "Hindi",
+            "it": "Italian",
+            "ja": "Japanese",
+            "pt-BR": "Brazilian Portuguese",
+            "zh": "Mandarin Chinese",
+            "ar": "Arabic",
+            "bg": "Bulgarian",
+            "cs": "Czech",
+            "da": "Danish",
+            "de": "German",
+            "el": "Greek",
+            "et": "Estonian",
+            "fi": "Finnish",
+            "hr": "Croatian",
+            "hu": "Hungarian",
+            "id": "Indonesian",
+            "ko": "Korean",
+            "lt": "Lithuanian",
+            "lv": "Latvian",
+            "nl": "Dutch",
+            "pl": "Polish",
+            "ro": "Romanian",
+            "ru": "Russian",
+            "sk": "Slovak",
+            "sl": "Slovenian",
+            "sv": "Swedish",
+            "tr": "Turkish",
+            "uk": "Ukrainian",
+            "vi": "Vietnamese",
+        }
+        return _names[self.value]
+
+    @property
+    def is_cjk(self) -> bool:
+        """True for CJK languages (Chinese, Japanese, Korean)."""
+        return self in (self.ZH, self.JA, self.KO)
+
+    @property
+    def supports_subtitle_tokens(self) -> bool:
+        """True if this language supports subtitle generation.
+
+        All languages are supported: languages without per-word timestamped
+        tokens fall back to segment-level fake tokens in the pipeline.
+        """
+        return True
+
+    @classmethod
+    def from_str(cls, value: str) -> Language:
+        """Parse from user input: ISO code, case-insensitive."""
+        if isinstance(value, Language):
+            return value
+        normalized = value.strip()
+        for member in cls:
+            if member.value.lower() == normalized.lower():
+                return member
+        raise ValueError(f"Invalid Language: {value!r}. Valid: {[m.value for m in cls]}")

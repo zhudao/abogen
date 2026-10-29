@@ -6,13 +6,17 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import warnings
+from contextlib import contextmanager
 from threading import Thread
 from typing import Dict, Optional
 
 from functools import lru_cache
 
 from dotenv import load_dotenv, find_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 def _load_environment() -> None:
@@ -28,6 +32,125 @@ def _load_environment() -> None:
 _load_environment()
 
 warnings.filterwarnings("ignore")
+
+# --- Console log colorization via rich (mirrors AutoSubSync's approach) ---
+
+try:  # rich is a declared dependency, but degrade gracefully if unavailable
+    from rich.console import Console
+    from rich.highlighter import NullHighlighter
+    from rich.logging import RichHandler
+
+    _RICH_AVAILABLE = True
+except Exception:  # pragma: no cover - fallback to plain logging
+    Console = None
+    NullHighlighter = None
+    RichHandler = None
+    _RICH_AVAILABLE = False
+
+
+def _console_supports_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return bool(sys.stderr.isatty())
+    except Exception:
+        return False
+
+
+_RICH_CONSOLE = None
+if Console is not None:
+    try:
+        _RICH_CONSOLE = Console(stderr=True, no_color=not _console_supports_color())
+    except Exception:  # pragma: no cover - defensive
+        _RICH_CONSOLE = None
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+if RichHandler is not None:
+
+    class RichConsoleHandler(RichHandler):
+        """RichHandler with default settings, except raw ANSI escapes are
+        stripped from messages first (werkzeug colorizes its own log lines
+        when attached to a TTY; without this they render as literal "[36m"
+        fragments)."""
+
+        def emit(self, record):
+            # Werkzeug logs its dev-server banner at INFO but hardcodes a
+            # "WARNING: " prefix into the message text. Promote the record so
+            # the level tag matches the content.
+            try:
+                message = _ANSI_ESCAPE_RE.sub("", record.getMessage())
+            except Exception:  # pragma: no cover - defensive
+                message = ""
+            if record.levelno < logging.WARNING and message.startswith("WARNING: "):
+                record.levelno = logging.WARNING
+                record.levelname = "WARNING"
+            super().emit(record)
+
+        def render_message(self, record, message):
+            message = _ANSI_ESCAPE_RE.sub("", message)
+            if message.startswith("WARNING: "):
+                message = message[len("WARNING: ") :]
+            return super().render_message(record, message)
+
+else:  # pragma: no cover - rich unavailable fallback
+    RichConsoleHandler = None  # type: ignore[assignment, misc]
+
+
+def console_handler(show_level=True):
+    """Build a colored console handler. Rich's RichHandler when available
+    (no timestamps, colored level tags), plain StreamHandler otherwise."""
+    if _RICH_CONSOLE is not None and RichConsoleHandler is not None:
+        return RichConsoleHandler(
+            console=_RICH_CONSOLE,
+            show_path=False,
+            show_time=False,
+            rich_tracebacks=True,
+        )
+    handler = logging.StreamHandler(sys.stderr)
+    prefix = "%(levelname)s - " if show_level else ""
+    handler.setFormatter(logging.Formatter(f"{prefix}%(message)s"))
+    return handler
+
+
+def setup_console_logging(level=logging.INFO):
+    """Configure the root logger once with a colored console handler."""
+    root = logging.getLogger()
+    if not root.handlers:
+        root.addHandler(console_handler())
+    root.setLevel(level)
+
+
+@contextmanager
+def timed_log(label, logger=None, level=logging.INFO):
+    """Context manager that logs the wall-clock time a block of code takes.
+
+    Used to surface which load/startup steps are slow. The elapsed time is
+    colorized: green < 1s, yellow 1-5s, red > 5s.
+    """
+    log = logger or logging.getLogger(__name__)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        if _RICH_AVAILABLE and _RICH_CONSOLE is not None and not _RICH_CONSOLE.no_color:
+            if elapsed >= 5.0:
+                color = "red"
+            elif elapsed >= 1.0:
+                color = "yellow"
+            else:
+                color = "green"
+            log.log(
+                level,
+                "Loaded %s in %s",
+                f"[cyan]{label}[/cyan]",
+                f"[{color}]{elapsed:.2f}s[/{color}]",
+                extra={"markup": True, "highlighter": NullHighlighter()},
+            )
+        else:
+            log.log(level, "Loaded %s in %.2fs", label, elapsed)
 
 
 def detect_encoding(file_path):
@@ -320,10 +443,6 @@ default_encoding = sys.getfilesystemencoding()
 
 
 def create_process(cmd, stdin=None, text=True, capture_output=False):
-    import logging
-
-    logger = logging.getLogger(__name__)
-
     # Configure root logger to output to console if not already configured
     root = logging.getLogger()
     if not root.handlers:
@@ -372,8 +491,8 @@ def create_process(cmd, stdin=None, text=True, capture_output=False):
             }
         )
 
-    # Print the command being executed
-    print(f"Executing: {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
+    # Log the command being executed
+    logger.info(f"Executing: {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
 
     proc = subprocess.Popen(cmd, **kwargs)
 
@@ -427,19 +546,6 @@ def save_config(config):
     except Exception:
         pass
 
-
-def calculate_text_length(text):
-    # Ignore chapter markers
-    text = re.sub(r"<<CHAPTER_MARKER:.*?>>", "", text)
-    # Ignore metadata patterns
-    text = re.sub(r"<<METADATA_[^:]+:[^>]*>>", "", text)
-    # Ignore newlines
-    text = text.replace("\n", "")
-    # Ignore leading/trailing spaces
-    text = text.strip()
-    # Calculate character count
-    char_count = len(text)
-    return char_count
 
 
 def get_gpu_acceleration(enabled):
@@ -507,7 +613,7 @@ def prevent_sleep_start():
             )
         else:
             # Non-systemd distro or systemd tools not installed: skip inhibition rather than crash
-            print(
+            logger.warning(
                 "systemd-inhibit not found: skipping sleep inhibition on this Linux system."
             )
 
@@ -530,19 +636,23 @@ def prevent_sleep_end():
 
 
 class LoadPipelineThread(Thread):
-    def __init__(self, callback, lang_code="a", device="cpu"):
+    def __init__(self, callback, lang_code="a", use_gpu=True):
         super().__init__()
         self.callback = callback
         self.lang_code = lang_code
-        self.device = device
+        self.use_gpu = use_gpu
 
     def run(self):
         try:
-            from abogen.tts_backend_registry import create_backend
+            from abogen.domain.pipeline_factory import create_pipeline_for_job
 
-            backend = create_backend(
-                "kokoro", lang_code=self.lang_code, device=self.device
-            )
+            with timed_log(
+                f"TTS pipeline (lang={self.lang_code}, gpu={self.use_gpu})",
+                logger=logging.getLogger("abogen.startup"),
+            ):
+                backend = create_pipeline_for_job(
+                    "kokoro", language=self.lang_code, use_gpu=self.use_gpu
+                )
             self.callback(backend, None)
         except Exception as e:
             self.callback(None, str(e))

@@ -1,0 +1,241 @@
+"""Shared TTS iteration loop used by both WebUI and PyQt conversion runners.
+
+The core pattern is identical across both UIs:
+
+    for seg in tts_segments(text, backend, voice, speed, split_pattern, current_time):
+        check_cancel()
+        update_progress(seg)
+        write_audio(seg, sink)
+        accumulate_subtitles(seg)
+
+After the loop, the caller processes accumulated subtitle tokens.
+
+This module provides ``run_tts_segment_loop`` which encapsulates that
+iteration, and ``synthesize_text`` which adds normalization on top —
+the single entry point both UIs should call for text-to-speech.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Protocol
+
+from abogen.domain.audio_sink import AudioSink
+from abogen.domain.conversion_pipeline import tts_segments
+from abogen.domain.enums import Language, SubtitleMode
+from abogen.domain.normalization import TTSContext
+from abogen.domain.progress import calc_etr_str
+from abogen.domain.subtitle_generation import process_subtitle_tokens
+
+
+class CancelChecker(Protocol):
+    """Returns True if conversion has been cancelled."""
+    def __call__(self) -> bool: ...
+
+
+@dataclass
+class SegmentStats:
+    """Running statistics updated per TTS segment."""
+    processed_chars: int = 0
+    current_time: float = 0.0
+    etr_start_time: float = field(default_factory=time.time)
+    total_characters: int = 0
+
+
+@dataclass
+class SegmentInfo:
+    """Read-only info about a TTS segment, passed to on_segment callback."""
+    graphemes: str
+    audio: Any
+    tokens: list
+    duration: float
+    chunk_start: float
+
+
+def run_tts_segment_loop(
+    *,
+    text: str,
+    params: SynthParams,
+    backend: Any,
+    voice: Any,
+    speed: float,
+    split_pattern: str,
+    total_steps: Optional[int] = None,
+    chapter_sink: Optional[AudioSink] = None,
+    preview_callback: Optional[Callable[[str], None]] = None,
+    on_segment: Optional[Callable[[SegmentInfo], None]] = None,
+) -> tuple[int, list]:
+    """Run the core TTS segment iteration loop.
+
+    Args:
+        text: Normalized text to synthesize.
+        params: Common synthesis parameters (stats, callbacks, sinks, etc.).
+        backend: TTS pipeline instance (Kokoro or Supertonic).
+        voice: Voice name/id for the backend.
+        speed: Speech speed multiplier.
+        split_pattern: Regex pattern used by the TTS engine for sentence splitting.
+        total_steps: Inference quality steps (Supertonic only, ignored by Kokoro).
+        preview_callback: Called with a short preview string per segment.
+        on_segment: Called with a SegmentInfo for each segment *before*
+            audio is written.  Useful for callers that need per-segment
+            subtitle processing (e.g. PyQt dual-writer pattern).
+            When provided, the default subtitle accumulation is skipped.
+
+    Returns:
+        Tuple of (segment_count, accumulated_subtitle_tokens).
+        The caller is responsible for processing subtitle tokens via
+        ``process_subtitle_tokens`` and writing entries to subtitle writers.
+    """
+    local_segments = 0
+    accumulated_tokens: list[dict] = []
+
+    for seg in tts_segments(
+        text,
+        backend=backend,
+        voice=voice,
+        speed=speed,
+        split_pattern=split_pattern,
+        current_time=params.stats.current_time,
+        total_steps=total_steps,
+    ):
+        if params.check_cancel():
+            break
+
+        local_segments += 1
+        params.stats.processed_chars += len(seg.graphemes)
+
+        # Progress
+        if params.stats.total_characters:
+            percent = min(int(params.stats.processed_chars / params.stats.total_characters * 100), 99)
+        else:
+            percent = 0 if params.stats.processed_chars == 0 else 99
+
+        etr_str = calc_etr_str(
+            time.time() - params.stats.etr_start_time,
+            params.stats.processed_chars,
+            params.stats.total_characters,
+        )
+        params.on_progress(percent, etr_str)
+
+        # Preview / log
+        if preview_callback:
+            preview_callback(seg.graphemes or "[silence]")
+
+        # Per-segment callback (for callers needing segment-level access)
+        if on_segment:
+            info = SegmentInfo(
+                graphemes=seg.graphemes,
+                audio=seg.audio,
+                tokens=list(seg.tokens) if seg.tokens else [],
+                duration=seg.duration,
+                chunk_start=getattr(seg, "chunk_start", params.stats.current_time),
+            )
+            on_segment(info)
+
+        # Write audio
+        if chapter_sink:
+            chapter_sink.write(seg.audio)
+        if params.audio_sink:
+            params.audio_sink.write(seg.audio)
+
+        # Accumulate subtitle tokens (default path; skipped if on_segment handles it)
+        if not on_segment and params.subtitle_mode != SubtitleMode.DISABLED and seg.tokens:
+            accumulated_tokens.extend(seg.tokens)
+
+        # Update timing
+        if params.audio_sink:
+            params.stats.current_time += seg.duration
+
+    return local_segments, accumulated_tokens
+
+
+def process_and_write_subtitles(
+    accumulated_tokens: list[dict],
+    subtitle_writer: Any,
+    *,
+    subtitle: "SubtitleConfig | str",
+    max_subtitle_words: int | None = None,
+    language: Language,
+    use_spacy_segmentation: bool,
+    fallback_end_time: float,
+) -> None:
+    """Process accumulated subtitle tokens and write entries to a subtitle writer.
+
+    Accepts a SubtitleConfig object or a subtitle mode string
+    for backward compatibility.
+    """
+    from abogen.domain.config_types import SubtitleConfig
+
+    if isinstance(subtitle, SubtitleConfig):
+        mode_str = subtitle.mode.value
+        words = subtitle.max_words
+    else:
+        mode_str = subtitle
+        words = max_subtitle_words or 50
+
+    if not accumulated_tokens or not subtitle_writer:
+        return
+    new_entries: list[tuple] = []
+    process_subtitle_tokens(
+        accumulated_tokens,
+        new_entries,
+        words,
+        mode_str,
+        language,
+        use_spacy_segmentation=use_spacy_segmentation,
+        fallback_end_time=fallback_end_time,
+    )
+    for start, end, text in new_entries:
+        subtitle_writer.write_entry(start=start, end=end, text=text)
+
+
+@dataclass(frozen=True)
+class SynthParams:
+    """Common parameters for synthesize_text calls.
+
+    Packed once by the executor to avoid repeating identical kwargs.
+    When adding new common params, change only this dataclass.
+    """
+    tts_context: TTSContext
+    stats: SegmentStats
+    check_cancel: CancelChecker
+    on_progress: Callable[[int, str], None]
+    audio_sink: Optional[AudioSink] = None
+    subtitle_mode: str = "Disabled"
+    max_subtitle_words: int = 50
+    language: Language = Language.EN_US
+    use_spacy_segmentation: bool = False
+
+
+def synthesize_text(
+    *,
+    text: str,
+    params: SynthParams,
+    backend: Any,
+    voice: Any,
+    speed: float,
+    total_steps: Optional[int] = None,
+    chapter_sink: Optional[AudioSink] = None,
+    preview_callback: Optional[Callable[[str], None]] = None,
+    on_segment: Optional[Callable[[SegmentInfo], None]] = None,
+    split_pattern_override: Optional[str] = None,
+) -> tuple[int, list]:
+    """Normalize text and run TTS — the single entry point for both UIs.
+
+    Combines TTSContext.normalize() + run_tts_segment_loop() into one call.
+    UI-specific concerns (provider resolution, progress display) stay in the UI.
+    """
+    normalized = params.tts_context.normalize(text)
+    return run_tts_segment_loop(
+        text=normalized,
+        params=params,
+        backend=backend,
+        voice=voice,
+        speed=speed,
+        total_steps=total_steps,
+        split_pattern=split_pattern_override or params.tts_context.split_pattern,
+        chapter_sink=chapter_sink,
+        preview_callback=preview_callback,
+        on_segment=on_segment,
+    )

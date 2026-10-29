@@ -6,6 +6,7 @@ from pathlib import Path
 from flask import Blueprint, request, jsonify, send_file, url_for, current_app
 from flask.typing import ResponseReturnValue
 
+from abogen.domain.enums import Language
 from abogen.webui.routes.utils.settings import (
     load_settings,
     load_integration_settings,
@@ -25,7 +26,7 @@ from abogen.voice_profiles import (
     normalize_profile_entry,
 )
 from abogen.webui.routes.utils.common import split_profile_spec
-from abogen.webui.routes.utils.preview import synthesize_preview, generate_preview_audio
+from abogen.webui.routes.utils.synthesize import synthesize_preview, generate_preview_audio
 from abogen.webui.routes.utils.voice import formula_from_profile
 from abogen.normalization_settings import (
     build_llm_configuration,
@@ -34,6 +35,7 @@ from abogen.normalization_settings import (
 )
 from abogen.llm_client import list_models, LLMClientError
 from abogen.kokoro_text_normalization import normalize_for_pipeline
+from abogen.tts_plugin.utils import is_plugin_registered
 from abogen.integrations.audiobookshelf import AudiobookshelfClient, AudiobookshelfConfig
 from abogen.integrations.calibre_opds import (
     CalibreOPDSClient,
@@ -45,6 +47,21 @@ from abogen.text_extractor import extract_from_path
 from werkzeug.utils import secure_filename
 
 api_bp = Blueprint("api", __name__)
+
+
+def _parse_language(value: Any) -> Language:
+    """Parse a frontend language value to Language enum.
+
+    This is the API boundary — frontend sends strings, backend parses
+    to Language enum. No engine-specific codes leak outside the engine.
+    """
+    if isinstance(value, Language):
+        return value
+    try:
+        return Language.from_str(str(value or "").strip())
+    except (ValueError, AttributeError):
+        return Language.EN_US
+
 
 # --- Voice Profile Routes ---
 
@@ -63,7 +80,7 @@ def api_save_voice_profile() -> ResponseReturnValue:
     if profile is None:
         # Speaker Studio payload format
         provider = str(payload.get("provider") or "kokoro").strip().lower()
-        if provider not in {"kokoro", "supertonic"}:
+        if not is_plugin_registered(provider):
             provider = "kokoro"
         if provider == "supertonic":
             profile = {
@@ -151,7 +168,7 @@ def api_export_voice_profiles() -> ResponseReturnValue:
 def api_voice_profiles_preview() -> ResponseReturnValue:
     payload = request.get_json(force=True, silent=True) or {}
     text = str(payload.get("text") or "").strip() or "Hello world"
-    language = str(payload.get("language") or "a").strip().lower() or "a"
+    language = _parse_language(payload.get("language"))
     speed = coerce_float(payload.get("speed"), 1.0)
     max_seconds = coerce_float(payload.get("max_seconds"), 8.0)
 
@@ -166,6 +183,11 @@ def api_voice_profiles_preview() -> ResponseReturnValue:
 
     voice_spec = ""
     resolved_provider = provider or "kokoro"
+
+    current_app.logger.info(
+        "[preview] provider=%s language=%s speed=%.2f profile=%s formula=%s",
+        resolved_provider, language, speed, profile_name or "-", formula or "-",
+    )
 
     profiles = load_profiles()
     if resolved_provider == "supertonic" and not profile_name:
@@ -185,7 +207,7 @@ def api_voice_profiles_preview() -> ResponseReturnValue:
             speed = float(normalized_entry.get("speed") or speed)
         else:
             voice_spec = formula_from_profile(normalized_entry) or ""
-            language = str(normalized_entry.get("language") or language)
+            language = _parse_language(normalized_entry.get("language") or language)
     elif formula:
         voice_spec = formula
         resolved_provider = "kokoro"
@@ -197,7 +219,13 @@ def api_voice_profiles_preview() -> ResponseReturnValue:
         voice_spec = formula_from_profile(normalized_entry) or ""
         resolved_provider = "kokoro"
 
+    current_app.logger.info(
+        "[preview] resolved: provider=%s voice_spec=%s",
+        resolved_provider, voice_spec[:80] if voice_spec else "-",
+    )
+
     if not voice_spec:
+        current_app.logger.warning("[preview] empty voice_spec, returning 400")
         return jsonify({"error": "Unable to resolve preview voice"}), 400
 
     try:
@@ -212,6 +240,7 @@ def api_voice_profiles_preview() -> ResponseReturnValue:
             max_seconds=max_seconds,
         )
     except Exception as exc:
+        current_app.logger.exception("[preview] synthesis failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
 @api_bp.post("/speaker-preview")
@@ -220,7 +249,7 @@ def api_speaker_preview() -> ResponseReturnValue:
     pending_id = str(payload.get("pending_id") or "").strip()
     text = payload.get("text", "Hello world")
     voice = payload.get("voice", "af_heart")
-    language = payload.get("language", "a")
+    language = _parse_language(payload.get("language"))
     speed_value = payload.get("speed")
     speed = coerce_float(speed_value, 1.0)
     tts_provider = str(payload.get("tts_provider") or "").strip().lower()
@@ -230,7 +259,7 @@ def api_speaker_preview() -> ResponseReturnValue:
     use_gpu = settings.get("use_gpu", False)
 
     base_spec, speaker_name = split_profile_spec(voice)
-    resolved_provider = tts_provider if tts_provider in {"kokoro", "supertonic"} else ""
+    resolved_provider = tts_provider if is_plugin_registered(tts_provider) else ""
 
     if speaker_name:
         entry = normalize_profile_entry(load_profiles().get(speaker_name))
@@ -280,83 +309,7 @@ def api_speaker_preview() -> ResponseReturnValue:
 # --- Integration Routes ---
 
 
-def _opds_metadata_overrides(metadata_payload: Mapping[str, Any]) -> Dict[str, Any]:
-    metadata_overrides: Dict[str, Any] = {}
-
-    def _stringify_metadata_value(value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, (list, tuple, set)):
-            parts = [str(item).strip() for item in value if item is not None]
-            parts = [part for part in parts if part]
-            return ", ".join(parts)
-        return str(value).strip()
-
-    raw_series = metadata_payload.get("series") or metadata_payload.get("series_name")
-    series_name = str(raw_series or "").strip()
-    if series_name:
-        metadata_overrides["series"] = series_name
-        metadata_overrides.setdefault("series_name", series_name)
-
-    series_index_value = (
-        metadata_payload.get("series_index")
-        or metadata_payload.get("series_position")
-        or metadata_payload.get("series_sequence")
-        or metadata_payload.get("book_number")
-    )
-    if series_index_value is not None:
-        series_index_text = str(series_index_value).strip()
-        if series_index_text:
-            metadata_overrides.setdefault("series_index", series_index_text)
-            metadata_overrides.setdefault("series_position", series_index_text)
-            metadata_overrides.setdefault("series_sequence", series_index_text)
-            metadata_overrides.setdefault("book_number", series_index_text)
-
-    tags_value = metadata_payload.get("tags") or metadata_payload.get("keywords")
-    if tags_value:
-        tags_text = _stringify_metadata_value(tags_value)
-        if tags_text:
-            metadata_overrides.setdefault("tags", tags_text)
-            metadata_overrides.setdefault("keywords", tags_text)
-            metadata_overrides.setdefault("genre", tags_text)
-
-    description_value = metadata_payload.get("description") or metadata_payload.get("summary")
-    if description_value:
-        description_text = _stringify_metadata_value(description_value)
-        if description_text:
-            metadata_overrides.setdefault("description", description_text)
-            metadata_overrides.setdefault("summary", description_text)
-
-    subtitle_value = (
-        metadata_payload.get("subtitle")
-        or metadata_payload.get("sub_title")
-        or metadata_payload.get("calibre_subtitle")
-    )
-    if subtitle_value:
-        subtitle_text = _stringify_metadata_value(subtitle_value)
-        if subtitle_text:
-            metadata_overrides.setdefault("subtitle", subtitle_text)
-
-    publisher_value = metadata_payload.get("publisher")
-    if publisher_value:
-        publisher_text = _stringify_metadata_value(publisher_value)
-        if publisher_text:
-            metadata_overrides.setdefault("publisher", publisher_text)
-
-    # Author mapping: Abogen templates look for either 'authors' or 'author'.
-    authors_value = (
-        metadata_payload.get("authors")
-        or metadata_payload.get("author")
-        or metadata_payload.get("creator")
-        or metadata_payload.get("dc_creator")
-    )
-    if authors_value:
-        authors_text = _stringify_metadata_value(authors_value)
-        if authors_text:
-            metadata_overrides.setdefault("authors", authors_text)
-            metadata_overrides.setdefault("author", authors_text)
-
-    return metadata_overrides
+from abogen.domain.metadata_overrides import normalize_opds_metadata as _opds_metadata_overrides
 
 @api_bp.get("/integrations/calibre-opds/feed")
 def api_calibre_opds_feed() -> ResponseReturnValue:
@@ -651,7 +604,7 @@ def api_entity_pronunciation_preview() -> ResponseReturnValue:
     token = payload.get("token", "").strip()
     pronunciation = payload.get("pronunciation", "").strip()
     voice = payload.get("voice", "").strip()
-    language = payload.get("language", "a").strip()
+    language = _parse_language(payload.get("language"))
     
     if not token and not pronunciation:
         return jsonify({"error": "Token or pronunciation required"}), 400

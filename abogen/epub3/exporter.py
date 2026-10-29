@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Pattern, Sequence, Tuple
 import zipfile
 
 from abogen.text_extractor import ExtractedChapter, ExtractionResult
+from abogen.domain.metadata_helpers import normalize_metadata_map
 
 
 @dataclass(slots=True)
@@ -22,7 +23,7 @@ class ChunkOverlay:
     start: Optional[float]
     end: Optional[float]
     speaker_id: str
-    voice: Optional[str]
+    voice: Optional[Dict[str, str]]
     level: Optional[str] = None
     group_id: Optional[str] = None
 
@@ -59,7 +60,7 @@ class EPUB3PackageBuilder:
         self.output_path = output_path
         self.book_id = book_id or str(uuid.uuid4())
         self.extraction = extraction
-        self.metadata_tags = _normalize_metadata(metadata_tags)
+        self.metadata_tags = normalize_metadata_map(metadata_tags)
         self.chapter_markers = list(chapter_markers or [])
         self.chunk_markers = list(chunk_markers or [])
         self.chunks = list(chunks or [])
@@ -273,7 +274,7 @@ class EPUB3PackageBuilder:
                     start=_safe_float(marker.get("start")),
                     end=_safe_float(marker.get("end")),
                     speaker_id=speaker_id,
-                    voice=str(voice) if voice else None,
+                    voice=voice if isinstance(voice, dict) else None,
                     level=str(level) if level else None,
                     group_id=normalized_group_id,
                 )
@@ -516,9 +517,14 @@ def build_epub3_package(
     chunks: Iterable[Dict[str, Any]],
     audio_path: Path,
     speaker_mode: str = "single",
+    cover: "CoverConfig | None" = None,
     cover_image_path: Optional[Path] = None,
     cover_image_mime: Optional[str] = None,
 ) -> Path:
+    from abogen.domain.config_types import CoverConfig
+    if isinstance(cover, CoverConfig):
+        cover_image_path = cover.path
+        cover_image_mime = cover.mime
     builder = EPUB3PackageBuilder(
         output_path=output_path,
         book_id=book_id,
@@ -543,15 +549,6 @@ def build_epub3_package(
 class ChunkLookup:
     by_id: Dict[str, Dict[str, Any]]
     by_chapter: Dict[int, List[Dict[str, Any]]]
-
-
-def _normalize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    normalized: Dict[str, str] = {}
-    for key, value in (metadata or {}).items():
-        if value is None:
-            continue
-        normalized[str(key).lower()] = str(value)
-    return normalized
 
 
 def _combine_metadata(*sources: Dict[str, Any]) -> Dict[str, str]:
@@ -696,7 +693,12 @@ def _group_chunks_for_render(chunks: Sequence[ChunkOverlay]) -> List[Tuple[Optio
 def _render_chunk_inline(chunk: ChunkOverlay) -> str:
     escaped_id = html.escape(chunk.id)
     speaker_attr = f" data-speaker=\"{html.escape(chunk.speaker_id)}\"" if chunk.speaker_id else ""
-    voice_attr = f" data-voice=\"{html.escape(chunk.voice)}\"" if chunk.voice else ""
+    voice_str = None
+    if chunk.voice and isinstance(chunk.voice, dict):
+        name = chunk.voice.get("voice", "")
+        provider = chunk.voice.get("provider", "")
+        voice_str = f"{name}@{provider}" if name and provider else name or None
+    voice_attr = f" data-voice=\"{html.escape(voice_str)}\"" if voice_str else ""
     level_attr = f" data-level=\"{html.escape(chunk.level)}\"" if chunk.level else ""
     raw_text = chunk.text or ""
     escaped_text = html.escape(raw_text)

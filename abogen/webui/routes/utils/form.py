@@ -1,12 +1,15 @@
-import re
+import logging
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, cast
 from flask import request, render_template, jsonify
 from flask.typing import ResponseReturnValue
 
+from abogen.domain.enums import Language
+from abogen.application.chapter_selection import build_chapter_payload
 from abogen.webui.service import PendingJob, JobStatus
 from abogen.webui.routes.utils.service import get_service
+from abogen.tts_plugin.utils import is_plugin_registered
 from abogen.webui.routes.utils.settings import (
     load_settings,
     coerce_bool,
@@ -19,20 +22,24 @@ from abogen.webui.routes.utils.settings import (
     audiobookshelf_manual_available,
 )
 from abogen.webui.routes.utils.voice import (
+    inject_recommended_voices,
     parse_voice_formula,
+    template_options,
+)
+from abogen.domain.speaker_metadata import prepare_speaker_metadata
+from abogen.domain.metadata_helpers import expand_metadata_aliases
+from abogen.domain.voice_resolution import (
     formula_from_profile,
     resolve_voice_setting,
     resolve_voice_choice,
-    prepare_speaker_metadata,
-    template_options,
 )
 from abogen.webui.routes.utils.entity import sync_pronunciation_overrides
 from abogen.webui.routes.utils.epub import job_download_flags
-from abogen.webui.routes.utils.common import split_profile_spec
-from abogen.utils import calculate_text_length
+from abogen.webui.routes.utils.common import split_profile_spec, extract_checkbox
+from abogen.domain.text_utils import calculate_text_length
 from abogen.voice_profiles import serialize_profiles, normalize_profile_entry
 from abogen.chunking import ChunkLevel, build_chunks_for_chapters
-from abogen.constants import VOICES_INTERNAL
+from abogen.tts_plugin.utils import get_default_voice
 from abogen.speaker_configs import get_config
 from abogen.kokoro_text_normalization import normalize_roman_numeral_titles
 from dataclasses import dataclass
@@ -65,109 +72,6 @@ _WIZARD_STEP_META = {
     },
 }
 
-_SUPPLEMENT_TITLE_PATTERNS: List[tuple[re.Pattern[str], float]] = [
-    (re.compile(r"\btitle\s+page\b"), 3.0),
-    (re.compile(r"\bcopyright\b"), 2.4),
-    (re.compile(r"\btable\s+of\s+contents\b"), 2.8),
-    (re.compile(r"\bcontents\b"), 2.0),
-    (re.compile(r"\backnowledg(e)?ments?\b"), 2.0),
-    (re.compile(r"\bdedication\b"), 2.0),
-    (re.compile(r"\babout\s+the\s+author(s)?\b"), 2.4),
-    (re.compile(r"\balso\s+by\b"), 2.0),
-    (re.compile(r"\bpraise\s+for\b"), 2.0),
-    (re.compile(r"\bcolophon\b"), 2.2),
-    (re.compile(r"\bpublication\s+data\b"), 2.2),
-    (re.compile(r"\btranscriber'?s?\s+note\b"), 2.2),
-    (re.compile(r"\bglossary\b"), 2.0),
-    (re.compile(r"\bindex\b"), 2.0),
-    (re.compile(r"\bbibliograph(y|ies)\b"), 2.0),
-    (re.compile(r"\breferences\b"), 1.8),
-    (re.compile(r"\bappendix\b"), 1.9),
-]
-
-_CONTENT_TITLE_PATTERNS: List[re.Pattern[str]] = [
-    re.compile(r"\bchapter\b"),
-    re.compile(r"\bbook\b"),
-    re.compile(r"\bpart\b"),
-    re.compile(r"\bsection\b"),
-    re.compile(r"\bscene\b"),
-    re.compile(r"\bprologue\b"),
-    re.compile(r"\bepilogue\b"),
-    re.compile(r"\bintroduction\b"),
-    re.compile(r"\bstory\b"),
-]
-
-_SUPPLEMENT_TEXT_KEYWORDS: List[tuple[str, float]] = [
-    ("copyright", 1.2),
-    ("all rights reserved", 1.1),
-    ("isbn", 0.9),
-    ("library of congress", 1.0),
-    ("table of contents", 1.0),
-    ("dedicated to", 0.8),
-    ("acknowledg", 0.8),
-    ("printed in", 0.6),
-    ("permission", 0.6),
-    ("publisher", 0.5),
-    ("praise for", 0.9),
-    ("also by", 0.9),
-    ("glossary", 0.8),
-    ("index", 0.8),
-    ("newsletter", 3.2),
-    ("mailing list", 2.6),
-    ("sign-up", 2.2),
-]
-
-def supplement_score(title: str, text: str, index: int) -> float:
-    normalized_title = (title or "").lower()
-    score = 0.0
-
-    for pattern, weight in _SUPPLEMENT_TITLE_PATTERNS:
-        if pattern.search(normalized_title):
-            score += weight
-
-    for pattern in _CONTENT_TITLE_PATTERNS:
-        if pattern.search(normalized_title):
-            score -= 2.0
-
-    stripped_text = (text or "").strip()
-    length = len(stripped_text)
-    if length <= 150:
-        score += 0.9
-    elif length <= 400:
-        score += 0.6
-    elif length <= 800:
-        score += 0.35
-
-    lowercase_text = stripped_text.lower()
-    for keyword, weight in _SUPPLEMENT_TEXT_KEYWORDS:
-        if keyword in lowercase_text:
-            score += weight
-
-    if index == 0 and score > 0:
-        score += 0.25
-
-    return score
-
-
-def should_preselect_chapter(
-    title: str,
-    text: str,
-    index: int,
-    total_count: int,
-) -> bool:
-    if total_count <= 1:
-        return True
-    score = supplement_score(title, text, index)
-    return score < 1.9
-
-
-def ensure_at_least_one_chapter_enabled(chapters: List[Dict[str, Any]]) -> None:
-    if not chapters:
-        return
-    if any(chapter.get("enabled") for chapter in chapters):
-        return
-    best_index = max(range(len(chapters)), key=lambda idx: chapters[idx].get("characters", 0))
-    chapters[best_index]["enabled"] = True
 
 def apply_prepare_form(
     pending: PendingJob, form: Mapping[str, Any]
@@ -444,7 +348,10 @@ def apply_book_step_form(
     language_fallback = pending.language or settings.get("language", "en")
     raw_language = (form.get("language") or language_fallback or "en").strip()
     if raw_language:
-        pending.language = raw_language
+        try:
+            pending.language = Language.from_str(raw_language)
+        except (ValueError, AttributeError):
+            pending.language = Language.EN_US
 
     subtitle_mode = (form.get("subtitle_mode") or pending.subtitle_mode or "Disabled").strip()
     if subtitle_mode:
@@ -536,28 +443,11 @@ def apply_book_step_form(
     else:
         pending.normalize_chapter_opening_caps = caps_default
 
-    def _extract_checkbox(name: str, default: bool) -> bool:
-        values: List[str] = []
-        getter = getattr(form, "getlist", None)
-        if callable(getter):
-            raw_values = getter(name)
-            if raw_values:
-                values = list(cast(Iterable[str], raw_values))
-        else:
-            raw_flag = form.get(name)
-            if raw_flag is not None:
-                values = [raw_flag]
-        if values:
-            return coerce_bool(values[-1], default)
-        if hasattr(form, "__contains__") and name in form:
-            return False
-        return default
-
     overrides_existing = getattr(pending, "normalization_overrides", None)
     overrides: Dict[str, Any] = dict(overrides_existing or {})
     for key in _NORMALIZATION_BOOLEAN_KEYS:
         default_toggle = overrides.get(key, bool(settings.get(key, True)))
-        overrides[key] = _extract_checkbox(key, default_toggle)
+        overrides[key] = extract_checkbox(form, key, default_toggle)
     for key in _NORMALIZATION_STRING_KEYS:
         default_val = overrides.get(key, str(settings.get(key, "")))
         val = form.get(key)
@@ -579,7 +469,7 @@ def apply_book_step_form(
     # spec (e.g. "speaker:Name" for saved speakers, or a Kokoro mix formula).
     # This enables mixed-provider conversions (e.g. narrator=SuperTonic, characters=Kokoro).
     provider_value = str(form.get("tts_provider") or "").strip().lower()
-    if provider_value in {"kokoro", "supertonic"}:
+    if is_plugin_registered(provider_value):
         pending.tts_provider = provider_value
 
     # Determine the base speaker selection (saved speaker ref or raw voice).
@@ -616,8 +506,8 @@ def apply_book_step_form(
         custom_formula = ""
 
     base_voice_spec = resolved_default_voice or narrator_voice_raw
-    if not base_voice_spec and VOICES_INTERNAL:
-        base_voice_spec = VOICES_INTERNAL[0]
+    if not base_voice_spec:
+        base_voice_spec = get_default_voice("kokoro")
 
     voice_choice, resolved_language, selected_profile = resolve_voice_choice(
         pending.language,
@@ -628,7 +518,10 @@ def apply_book_step_form(
     )
 
     if resolved_language:
-        pending.language = resolved_language
+        try:
+            pending.language = Language.from_str(str(resolved_language))
+        except (ValueError, AttributeError):
+            pass  # keep existing language
 
     if profile_selection == "__formula" and custom_formula_raw:
         pending.voice = custom_formula_raw
@@ -650,34 +543,26 @@ def apply_book_step_form(
     if "meta_subtitle" in form:
         pending.metadata_tags["subtitle"] = str(form.get("meta_subtitle", "")).strip()
 
+    # Collect user-editable metadata fields that have concept aliases
+    user_metadata: Dict[str, str] = {}
     if "meta_author" in form:
-        authors = str(form.get("meta_author", "")).strip()
-        pending.metadata_tags["authors"] = authors
-        pending.metadata_tags["author"] = authors
-
+        user_metadata["author"] = str(form.get("meta_author", "")).strip()
     if "meta_series" in form:
-        series = str(form.get("meta_series", "")).strip()
-        pending.metadata_tags["series"] = series
-        pending.metadata_tags["series_name"] = series
-        pending.metadata_tags["seriesname"] = series
-        pending.metadata_tags["series_title"] = series
-        pending.metadata_tags["seriestitle"] = series
-        # If user manually edits series, update opds_series too so it persists
-        if "opds_series" in pending.metadata_tags:
-            pending.metadata_tags["opds_series"] = series
-
+        user_metadata["series"] = str(form.get("meta_series", "")).strip()
     if "meta_series_index" in form:
-        idx = str(form.get("meta_series_index", "")).strip()
-        pending.metadata_tags["series_index"] = idx
-        pending.metadata_tags["series_sequence"] = idx
+        user_metadata["series_index"] = str(form.get("meta_series_index", "")).strip()
+    if "meta_description" in form:
+        user_metadata["description"] = str(form.get("meta_description", "")).strip()
+
+    if user_metadata:
+        expanded = expand_metadata_aliases(user_metadata)
+        pending.metadata_tags.update(expanded)
+        # If user manually edits series, update opds_series too so it persists
+        if "meta_series" in form and "opds_series" in pending.metadata_tags:
+            pending.metadata_tags["opds_series"] = expanded.get("series", "")
 
     if "meta_publisher" in form:
         pending.metadata_tags["publisher"] = str(form.get("meta_publisher", "")).strip()
-
-    if "meta_description" in form:
-        desc = str(form.get("meta_description", "")).strip()
-        pending.metadata_tags["description"] = desc
-        pending.metadata_tags["summary"] = desc
 
     if coerce_bool(form.get("remove_cover"), False):
         pending.cover_image_path = None
@@ -752,36 +637,13 @@ def build_pending_job_from_extraction(
         getattr(extraction, "combined_text", "")
     )
     chapters_source = getattr(extraction, "chapters", []) or []
-    total_chapter_count = len(chapters_source)
-    chapters_payload: List[Dict[str, Any]] = []
-    for index, chapter in enumerate(chapters_source):
-        enabled = should_preselect_chapter(chapter.title, chapter.text, index, total_chapter_count)
-        chapters_payload.append(
-            {
-                "id": f"{index:04d}",
-                "index": index,
-                "title": chapter.title,
-                "text": chapter.text,
-                "characters": calculate_text_length(chapter.text),
-                "enabled": enabled,
-            }
-        )
+    chapters_payload = build_chapter_payload(chapters_source, source_name=original_name)
 
-    if not chapters_payload:
-        chapters_payload.append(
-            {
-                "id": "0000",
-                "index": 0,
-                "title": original_name,
-                "text": "",
-                "characters": 0,
-                "enabled": True,
-            }
-        )
-
-    ensure_at_least_one_chapter_enabled(chapters_payload)
-
-    language = str(form.get("language") or "a").strip() or "a"
+    raw_language = str(form.get("language") or "a").strip() or "a"
+    try:
+        language = Language.from_str(raw_language)
+    except (ValueError, AttributeError):
+        language = Language.EN_US
     profiles_map = dict(profiles) if isinstance(profiles, Mapping) else dict(profiles or {})
     default_voice_setting = settings.get("default_voice") or ""
     resolved_default_voice, inferred_profile, inferred_language = resolve_voice_setting(
@@ -796,8 +658,8 @@ def build_pending_job_from_extraction(
         profile_selection = inferred_profile
 
     base_voice = base_voice_input or resolved_default_voice or str(default_voice_setting).strip()
-    if not base_voice and VOICES_INTERNAL:
-        base_voice = VOICES_INTERNAL[0]
+    if not base_voice:
+        base_voice = get_default_voice("kokoro")
     selected_speaker_config = (form.get("speaker_config") or "").strip()
     speaker_config_payload = get_config(selected_speaker_config) if selected_speaker_config else None
 
@@ -883,27 +745,13 @@ def build_pending_job_from_extraction(
         run_analysis=initial_analysis,
         speaker_config=speaker_config_payload,
         apply_config=bool(speaker_config_payload),
+        inject_recommended=inject_recommended_voices,
     )
-
-    def _extract_checkbox(name: str, default: bool) -> bool:
-        values: List[str] = []
-        getter = getattr(form, "getlist", None)
-        if callable(getter):
-            raw_values = getter(name)
-            if raw_values:
-                values = list(cast(Iterable[str], raw_values))
-        else:
-            raw_flag = form.get(name)
-            if raw_flag is not None:
-                values = [raw_flag]
-        if values:
-            return coerce_bool(values[-1], default)
-        return default
 
     normalization_overrides = {}
     for key in _NORMALIZATION_BOOLEAN_KEYS:
         default_val = bool(settings.get(key, True))
-        normalization_overrides[key] = _extract_checkbox(key, default_val)
+        normalization_overrides[key] = extract_checkbox(form, key, default_val)
 
     for key in _NORMALIZATION_STRING_KEYS:
         default_val = str(settings.get(key, ""))
@@ -912,6 +760,11 @@ def build_pending_job_from_extraction(
             normalization_overrides[key] = str(val)
         else:
             normalization_overrides[key] = default_val
+
+    logging.info(
+        "[form] Creating PendingJob: language=%s voice=%s speed=%.2f provider=%s",
+        language, voice, speed, settings.get("tts_provider", "kokoro"),
+    )
 
     pending = PendingJob(
         id=uuid.uuid4().hex,
@@ -955,6 +808,8 @@ def build_pending_job_from_extraction(
         speaker_analysis_threshold=analysis_threshold,
         analysis_requested=initial_analysis,
     )
+
+    apply_book_step_form(pending, form, settings=settings, profiles=profiles_map)
 
     return PendingBuildResult(
         pending=pending,

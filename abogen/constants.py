@@ -1,4 +1,5 @@
 from abogen.utils import get_version
+from abogen.domain.enums import Language
 
 # Program Information
 PROGRAM_NAME = "abogen"
@@ -16,8 +17,22 @@ SUBTITLE_FORMATS = [
     ("ass_centered_narrow", "ASS (centered narrow)"),
 ]
 
-# Language description mapping
+# Language description mapping (Language enum → human-readable label).
 LANGUAGE_DESCRIPTIONS = {
+    Language.EN_US: "American English",
+    Language.EN_GB: "British English",
+    Language.ES: "Spanish",
+    Language.FR: "French",
+    Language.HI: "Hindi",
+    Language.IT: "Italian",
+    Language.JA: "Japanese",
+    Language.PT_BR: "Brazilian Portuguese",
+    Language.ZH: "Mandarin Chinese",
+}
+
+# Display-only mapping for kokoro codes → labels.
+# Used by voice catalog and PyQt (legacy) where kokoro codes are still present.
+KOKORO_CODE_LABELS = {
     "a": "American English",
     "b": "British English",
     "e": "Spanish",
@@ -55,83 +70,24 @@ SUPPORTED_INPUT_FORMATS = [
     "vtt",
 ]
 
-# Supported languages for subtitle generation
-# Currently, only 'a (American English)' and 'b (British English)' are supported for subtitle generation.
-# This is because tokens that contain timestamps are not generated for other languages in the Kokoro pipeline.
-# Please refer to: https://github.com/hexgrad/kokoro/blob/6d87f4ae7abc2d14dbc4b3ef2e5f19852e861ac2/kokoro/pipeline.py
-# 383 English processing (unchanged)
-# 384 if self.lang_code in 'ab':
-SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION = list(LANGUAGE_DESCRIPTIONS.keys())
-
-# Voice and sample text constants
-VOICES_INTERNAL = [
-    "af_alloy",
-    "af_aoede",
-    "af_bella",
-    "af_heart",
-    "af_jessica",
-    "af_kore",
-    "af_nicole",
-    "af_nova",
-    "af_river",
-    "af_sarah",
-    "af_sky",
-    "am_adam",
-    "am_echo",
-    "am_eric",
-    "am_fenrir",
-    "am_liam",
-    "am_michael",
-    "am_onyx",
-    "am_puck",
-    "am_santa",
-    "bf_alice",
-    "bf_emma",
-    "bf_isabella",
-    "bf_lily",
-    "bm_daniel",
-    "bm_fable",
-    "bm_george",
-    "bm_lewis",
-    "ef_dora",
-    "em_alex",
-    "em_santa",
-    "ff_siwis",
-    "hf_alpha",
-    "hf_beta",
-    "hm_omega",
-    "hm_psi",
-    "if_sara",
-    "im_nicola",
-    "jf_alpha",
-    "jf_gongitsune",
-    "jf_nezumi",
-    "jf_tebukuro",
-    "jm_kumo",
-    "pf_dora",
-    "pm_alex",
-    "pm_santa",
-    "zf_xiaobei",
-    "zf_xiaoni",
-    "zf_xiaoxiao",
-    "zf_xiaoyi",
-    "zm_yunjian",
-    "zm_yunxi",
-    "zm_yunxia",
-    "zm_yunyang",
-]
+# Supported languages for subtitle generation.
+# All languages are supported: only English emits per-word timestamped tokens
+# in the Kokoro pipeline, but other languages fall back to segment-level fake
+# tokens (see abogen.domain.tokens.FakeToken), so subtitles are still
+# generated at segment granularity.
+SUPPORTED_LANGUAGES_FOR_SUBTITLE_GENERATION = list(Language)
 
 # Voice and sample text mapping
 SAMPLE_VOICE_TEXTS = {
-    "a": "This is a sample of the selected voice.",
-    "b": "This is a sample of the selected voice.",
-    "e": "Este es una muestra de la voz seleccionada.",
-    "f": "Ceci est un exemple de la voix sélectionnée.",
-    "h": "यह चयनित आवाज़ का एक नमूना है।",
-    "i": "Questo è un esempio della voce selezionata.",
-    "j": "これは選択した声のサンプルです。",
-    "p": "Este é um exemplo da voz selecionada.",
-    "z": "这是所选语音的示例。",
+    Language.EN_US: "This is a sample of the selected voice.",
+    Language.EN_GB: "This is a sample of the selected voice.",
+    Language.ES: "Este es una muestra de la voz seleccionada.",
+    Language.FR: "Ceci est un exemple de la voix sélectionnée.",
+    Language.HI: "यह चयनित आवाज़ का एक नमूना है।",
+    Language.IT: "Questo è un esempio della voce selezionata.",
+    Language.JA: "これは選択した声のサンプルです。",
+    Language.PT_BR: "Este é um exemplo da voz selecionada.",
+    Language.ZH: "这是所选语音的示例。",
 }
 
 COLORS = {
